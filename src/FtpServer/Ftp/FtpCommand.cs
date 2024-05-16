@@ -628,4 +628,13 @@ public enum FtpCommand
     /// </remarks>
     [FtpCommand("XSEN")]
     SendToTerminal,
+
+    /// <summary>
+    /// Calculate CRC32 checksum.
+    /// </summary>
+    /// <remarks>
+    /// Non-standard command
+    /// </remarks>
+    [FtpCommand("XCRC")]
+    CalculateCrc32Checksum,
 }

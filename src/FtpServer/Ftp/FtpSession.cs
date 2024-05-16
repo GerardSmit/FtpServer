@@ -37,9 +37,35 @@ public sealed class FtpSession(
         return Transport.Output.FlushAsync(token).GetAsValueTask();
     }
 
-    public ValueTask WriteAsync(ReadOnlySpan<byte> prefix)
+    public ValueTask WriteAsync(ReadOnlySpan<byte> data)
     {
-        Transport.Output.Write(prefix);
+        Transport.Output.Write(data);
+        return FlushAsync();
+    }
+
+    public ValueTask WriteAsync(ReadOnlySpan<byte> data, ReadOnlySpan<byte> data2)
+    {
+        var buffer = Transport.Output.GetSpan(data.Length + data2.Length);
+        data.CopyTo(buffer);
+        data2.CopyTo(buffer.Slice(data.Length));
+        Transport.Output.Advance(data.Length + data2.Length);
+        return FlushAsync();
+    }
+
+    public ValueTask WriteAsync(ReadOnlySpan<byte> data, ReadOnlySpan<byte> data2, ReadOnlySpan<byte> data3)
+    {
+        var buffer = Transport.Output.GetSpan(data.Length + data2.Length + data3.Length);
+        data.CopyTo(buffer);
+        data2.CopyTo(buffer.Slice(data.Length));
+        data3.CopyTo(buffer.Slice(data.Length + data2.Length));
+        Transport.Output.Advance(data.Length + data2.Length + data3.Length);
+        return FlushAsync();
+    }
+    public ValueTask WriteAsync(string data)
+    {
+        var buffer = Transport.Output.GetSpan(Encoding.GetMaxByteCount(data.Length));
+        var length = Encoding.GetBytes(data, buffer);
+        Transport.Output.Advance(length);
         return FlushAsync();
     }
 

@@ -62,7 +62,14 @@ public sealed class ActiveFtpStream(Stream stream, Socket socket) : FtpStream
             await sslStream.ShutdownAsync();
         }
 
-        socket.Shutdown(SocketShutdown.Both);
+        try
+        {
+            socket.Shutdown(SocketShutdown.Both);
+        }
+        catch
+        {
+            // Ignore
+        }
 
         await stream.DisposeAsync();
         socket.Dispose();

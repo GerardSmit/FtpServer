@@ -1,14 +1,21 @@
 ﻿using System.Buffers;
+using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Globalization;
+using System.IO.Hashing;
+using System.Runtime.CompilerServices;
 using System.Text;
 using FtpServer.Extensions;
 using FtpServer.IO;
+using FtpServer.Options;
+using Microsoft.Extensions.Options;
 using Zio;
 
 namespace FtpServer;
 
 public class DefaultFtpCommandHandler(
-    PermissionProvider permissionProvider
+    PermissionProvider permissionProvider,
+    IOptions<FtpOptions> options
 ) : FtpCommandHandler
 {
     protected override ValueTask UnknownAsync(FtpSession session, FtpCommand command, ReadOnlySequence<byte> data, CancellationToken token)
@@ -75,14 +82,13 @@ public class DefaultFtpCommandHandler(
     public override ValueTask ChangeWorkingDirectoryAsync(FtpSession session, ReadOnlySequence<byte> data, CancellationToken token)
     {
         var path = data.GetUPath(session.CurrentDirectory, session.Encoding);
-        var directory = session.FileSystem.GetDirectoryEntry(path);
 
-        if (!directory.Exists)
+        if (!session.FileSystem.DirectoryExists(path))
         {
             return session.WriteAsync("550 Requested action not taken.\r\n"u8);
         }
 
-        session.CurrentDirectory = directory.Path;
+        session.CurrentDirectory = path;
         return session.WriteAsync("250 Requested file action okay, completed.\r\n"u8);
     }
 
@@ -111,9 +117,23 @@ public class DefaultFtpCommandHandler(
         return base.ExtendedPassiveModeAsync(session, data, token);
     }
 
-    public override ValueTask FeatureListAsync(FtpSession session, ReadOnlySequence<byte> data, CancellationToken token)
+    public override async ValueTask FeatureListAsync(FtpSession session, ReadOnlySequence<byte> data, CancellationToken token)
     {
-        return base.FeatureListAsync(session, data, token);
+        var features = options.Value.Features;
+
+        await session.WriteAsync("211-Features:\r\n"u8);
+
+        if (options.Value.Ftps)
+        {
+            await session.WriteAsync(" AUTH TLS\r\n"u8);
+        }
+
+        if (features.XCRC)
+        {
+            await session.WriteAsync(" XCRC \"filename\" SP EP\r\n"u8);
+        }
+
+        await session.WriteAsync("211 End\r\n"u8);
     }
 
     public override ValueTask HelpAsync(FtpSession session, ReadOnlySequence<byte> data, CancellationToken token)
@@ -133,50 +153,65 @@ public class DefaultFtpCommandHandler(
 
     public override async ValueTask ListInformationAsync(FtpSession session, ReadOnlySequence<byte> data, CancellationToken token)
     {
+        await session.WriteAsync("150 Starting data transfer.\r\n"u8);
+
         await using var dataChannel = await session.Mode.CreateDataChannelAsync(session, token);
         var stream = dataChannel.Stream;
 
-        var items = session.FileSystem.EnumerateItems(session.CurrentDirectory, SearchOption.TopDirectoryOnly);
-
         var sb = new StringBuilder();
 
-        foreach (var item in items)
+        if (options.Value.Features.LISTR && (data.SequenceEquals("-R"u8) || data.SequenceEquals("-r"u8)))
         {
-            sb.Append(item.IsDirectory ? 'd' : '-');
+            var results = new ConcurrentDictionary<UPath, string>();
+            var paths = session.FileSystem
+                .EnumerateDirectories(session.CurrentDirectory, "*", SearchOption.AllDirectories)
+                .ToArray();
 
-            var path = session.FileSystem.ConvertPathToInternal(item.Path);
+            if (paths.Length > 0)
+            {
+                Parallel.For(
+                    0,
+                    paths.Length,
+                    new ParallelOptions
+                    {
+                        CancellationToken = token,
+                        MaxDegreeOfParallelism = Environment.ProcessorCount
+                    },
+                    () => new StringBuilder(),
+                    (index, _, sb) =>
+                    {
+                        var path = paths[index];
 
-            var result = permissionProvider.GetFilePermissions(item, path);
+                        sb.Append("\r\n.");
+                        sb.Append(path.FullName);
+                        sb.Append(":\r\n");
+                        WriteDirectory(sb, session.FileSystem.EnumerateItems(path, SearchOption.TopDirectoryOnly));
 
-            sb.Append(result.User.Read ? 'r' : '-');
-            sb.Append(result.User.Write ? 'w' : '-');
-            sb.Append(result.User.Execute ? 'x' : '-');
+                        results.TryAdd(path, sb.ToString());
+                        sb.Clear();
 
-            sb.Append(result.Group.Read ? 'r' : '-');
-            sb.Append(result.Group.Write ? 'w' : '-');
-            sb.Append(result.Group.Execute ? 'x' : '-');
+                        return sb;
+                    },
+                    _ => { });
+            }
 
-            sb.Append(result.Other.Read ? 'r' : '-');
-            sb.Append(result.Other.Write ? 'w' : '-');
-            sb.Append(result.Other.Execute ? 'x' : '-');
 
-            sb.Append(" 0 ");
+            sb.Append("\r\n.");
+            sb.Append(session.CurrentDirectory.FullName);
+            sb.Append(":\r\n");
+            WriteDirectory(sb, session.FileSystem.EnumerateItems(session.CurrentDirectory, SearchOption.TopDirectoryOnly));
 
-            sb.Append(result.OwnerName ?? "unknown");
-            sb.Append(' ');
-            sb.Append(result.GroupName ?? "unknown");
-
-            sb.Append(' ');
-            sb.Append(item.IsDirectory ? 0 : item.Length);
-            sb.Append(' ');
-
-            var lastWriteTime = item.LastWriteTime.UtcDateTime;
-            sb.Append(lastWriteTime.ToString("MMM dd HH:mm", CultureInfo.InvariantCulture));
-
-            sb.Append(' ');
-
-            sb.Append(item.GetName());
-            sb.Append("\r\n");
+            foreach (var path in paths)
+            {
+                if (results.TryGetValue(path, out var value))
+                {
+                    sb.Append(value);
+                }
+            }
+        }
+        else
+        {
+            WriteDirectory(sb, session.FileSystem.EnumerateItems(session.CurrentDirectory, SearchOption.TopDirectoryOnly));
         }
 
         var buffer = session.Encoding.GetBytes(sb.ToString());
@@ -185,6 +220,55 @@ public class DefaultFtpCommandHandler(
         await stream.FlushAsync(token);
 
         await session.WriteAsync("226 Transfer complete.\r\n"u8);
+        return;
+
+        void WriteDirectory(StringBuilder target, IEnumerable<FileSystemItem> items)
+        {
+            foreach (var item in items)
+            {
+                target.Append(item.IsDirectory ? 'd' : '-');
+
+                var path = session.FileSystem.ConvertPathToInternal(item.Path);
+                var result = permissionProvider.GetFilePermissions(item, path);
+
+                target.Append(result.User.Read ? 'r' : '-');
+                target.Append(result.User.Write ? 'w' : '-');
+                target.Append(result.User.Execute ? 'x' : '-');
+
+                target.Append(result.Group.Read ? 'r' : '-');
+                target.Append(result.Group.Write ? 'w' : '-');
+                target.Append(result.Group.Execute ? 'x' : '-');
+
+                target.Append(result.Other.Read ? 'r' : '-');
+                target.Append(result.Other.Write ? 'w' : '-');
+                target.Append(result.Other.Execute ? 'x' : '-');
+
+                target.Append(" 0 ");
+
+                target.Append(result.OwnerName ?? "unknown");
+                target.Append(' ');
+                target.Append(result.GroupName ?? "unknown");
+
+                target.Append(' ');
+                target.Append(item.IsDirectory ? 0 : item.Length);
+                target.Append(' ');
+
+                var lastWriteTime = item.LastWriteTime.UtcDateTime;
+                target.Append(lastWriteTime.ToString("MMM dd HH:mm", CultureInfo.InvariantCulture));
+
+                target.Append(' ');
+
+                target.Append(item.GetName());
+                target.Append("\r\n");
+            }
+        }
+    }
+
+    private class Local
+    {
+        public UPath Path { get; set; }
+
+        public StringBuilder StringBuilder { get; } = new();
     }
 
     public override ValueTask LongPortAsync(FtpSession session, ReadOnlySequence<byte> data, CancellationToken token)
@@ -338,6 +422,8 @@ public class DefaultFtpCommandHandler(
 
     public override async ValueTask RetrieveFileAsync(FtpSession session, ReadOnlySequence<byte> data, CancellationToken token)
     {
+        await session.WriteAsync("150 Starting data transfer.\r\n"u8);
+
         var path = data.GetUPath(session.CurrentDirectory, session.Encoding);
         var file = session.FileSystem.GetFileEntry(path);
 
@@ -350,7 +436,7 @@ public class DefaultFtpCommandHandler(
         await using var dataChannel = await session.Mode.CreateDataChannelAsync(session, token);
         var stream = dataChannel.Stream;
 
-        await using (var fileStream = file.Open(FileMode.Open, FileAccess.Read))
+        await using (var fileStream = file.Open(FileMode.Open, FileAccess.Read, FileShare.Read))
         {
             await fileStream.CopyToAsync(stream, token);
         }
@@ -405,6 +491,8 @@ public class DefaultFtpCommandHandler(
 
     public override async ValueTask StoreFileAsync(FtpSession session, ReadOnlySequence<byte> data, CancellationToken token)
     {
+        await session.WriteAsync("150 Starting data transfer.\r\n"u8);
+
         var path = data.GetUPath(session.CurrentDirectory, session.Encoding);
         var file = session.FileSystem.GetFileEntry(path);
 
@@ -489,5 +577,86 @@ public class DefaultFtpCommandHandler(
     public override ValueTask SendToTerminalAsync(FtpSession session, ReadOnlySequence<byte> data, CancellationToken token)
     {
         return base.SendToTerminalAsync(session, data, token);
+    }
+
+    public override async ValueTask CalculateCrc32ChecksumAsync(FtpSession session, ReadOnlySequence<byte> data, CancellationToken token)
+    {
+        if (!options.Value.Features.XCRC)
+        {
+            await session.WriteAsync("502 Command not implemented.\r\n"u8);
+            return;
+        }
+
+        if (!data.TryGetXCRC(session.CurrentDirectory, session.Encoding, out var request))
+        {
+            await session.WriteAsync("501 Syntax error in parameters or arguments.\r\n"u8);
+            return;
+        }
+
+        var file = session.FileSystem.GetFileEntry(request.Path);
+
+        if (!file.Exists)
+        {
+            await session.WriteAsync("550 Requested action not taken.\r\n"u8);
+            return;
+        }
+
+        var crc32 = new Crc32();
+
+        await using (var fileStream = file.Open(FileMode.Open, FileAccess.Read, FileShare.Read))
+        {
+            if (request.Start is not null)
+            {
+                fileStream.Seek(request.Start.Value, SeekOrigin.Begin);
+            }
+
+            // Sync is faster than async for big files.
+            // ReSharper disable once MethodHasAsyncOverloadWithCancellation
+            crc32.Append(fileStream);
+        }
+
+        var pool = ArrayPool<byte>.Shared;
+        var array = pool.Rent(crc32.HashLengthInBytes * 2);
+        var length = WriteCrc32(array, crc32);
+
+        await session.WriteAsync("250 "u8, array.AsSpan(0, length), "\r\n"u8);
+
+        pool.Return(array);
+        return;
+
+        int WriteCrc32(Span<byte> dst, Crc32 crc32)
+        {
+            Span<byte> src = stackalloc byte[crc32.HashLengthInBytes];
+            crc32.GetCurrentHash(src);
+
+            src.Reverse();
+
+            var i = 0;
+            var j = 0;
+            var b = src[i++];
+            dst[j++] = ToCharUpper(b >> 4);
+            dst[j++] = ToCharUpper(b);
+            while (i < src.Length)
+            {
+                b = src[i++];
+                dst[j++] = ToCharUpper(b >> 4);
+                dst[j++] = ToCharUpper(b);
+            }
+
+            return j;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        static byte ToCharUpper(int value)
+        {
+            value = (value & 0xF) + '0';
+
+            if (value > '9')
+            {
+                value += 'A' - ('9' + 1);
+            }
+
+            return (byte)value;
+        }
     }
 }

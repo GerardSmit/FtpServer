@@ -9,6 +9,23 @@ namespace FtpServer.Extensions;
 
 public static class SequenceExtensions
 {
+    public static bool SequenceEquals(this ReadOnlySequence<byte> sequence, ReadOnlySpan<byte> value)
+    {
+        if (sequence.Length != value.Length)
+        {
+            return false;
+        }
+
+        if (sequence.IsSingleSegment)
+        {
+            return sequence.First.Span.SequenceEqual(value);
+        }
+
+        Span<byte> buffer = stackalloc byte[(int)sequence.Length];
+        sequence.CopyTo(buffer);
+        return buffer.SequenceEqual(value);
+    }
+
     public static bool TryGetInt32(this ReadOnlySequence<byte> sequence, out int value)
     {
         if (sequence.IsSingleSegment)
@@ -46,18 +63,27 @@ public static class SequenceExtensions
             buffer = temp;
         }
 
+        return ToUPath(buffer, root, encoding);
+    }
+
+    public static UPath ToUPath(this in ReadOnlySpan<byte> buffer, UPath root, Encoding encoding)
+    {
         if (buffer.Length == 0)
         {
             return root;
         }
 
-        if (buffer[0] == '/')
+        var span = buffer[0] == '"' && buffer[^1] == '"'
+            ? buffer.Slice(1, buffer.Length - 2)
+            : buffer;
+
+        if (span[0] == '/')
         {
-            return new UPath(encoding.GetString(buffer));
+            return new UPath(encoding.GetString(span));
         }
 
-        var length = root.FullName.Length + buffer.Length + (root == UPath.Root ? 0 : 1);
-        var path = string.Create(length, new Context(buffer, root, encoding), static (span, state) =>
+        var length = root.FullName.Length + span.Length + (root == UPath.Root ? 0 : 1);
+        var path = string.Create(length, new Context(span, root, encoding), static (span, state) =>
         {
             var root = state.Root;
             int index;
@@ -127,4 +153,60 @@ public static class SequenceExtensions
             return sequence.TryGetInt32(min: 0, max: 255, out result);
         }
     }
+
+    public static bool TryGetXCRC(this ReadOnlySequence<byte> sequence, UPath root, Encoding encoding, out Crc32Request request)
+    {
+        scoped ReadOnlySpan<byte> buffer;
+
+        if (sequence.IsSingleSegment)
+        {
+            buffer = sequence.First.Span;
+        }
+        else
+        {
+            Span<byte> temp = stackalloc byte[(int)sequence.Length];
+            sequence.CopyTo(temp);
+            buffer = temp;
+        }
+
+        var commaIndex = buffer.IndexOf((byte)',');
+
+        if (commaIndex == -1)
+        {
+            // XCRC <File Name>
+            request = new Crc32Request(buffer.ToUPath(root, encoding), default, default);
+            return true;
+        }
+
+        var path = buffer.Slice(0, commaIndex).ToUPath(root, encoding);
+        var range = buffer.Slice(commaIndex + 1);
+
+        commaIndex = range.IndexOf((byte)',');
+
+        if (commaIndex == -1)
+        {
+            // XCRC <File Name>, <EP>
+            if (!int.TryParse(range.Trim((byte)' '), NumberStyles.None, CultureInfo.InvariantCulture, out var end))
+            {
+                request = default;
+                return false;
+            }
+
+            request = new Crc32Request(path, default, end);
+            return true;
+        }
+
+        // XCRC <File Name>, <SP>, <EP>
+        if (!int.TryParse(range.Slice(0, commaIndex).Trim((byte)' '), NumberStyles.None, CultureInfo.InvariantCulture, out var startValue) ||
+            !int.TryParse(range.Slice(commaIndex + 1).Trim((byte)' '), NumberStyles.None, CultureInfo.InvariantCulture, out var endValue))
+        {
+            request = default;
+            return false;
+        }
+
+        request = new Crc32Request(path, startValue, endValue);
+        return true;
+    }
 }
+
+public record struct Crc32Request(UPath Path, int? Start, int? End);
