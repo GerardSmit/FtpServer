@@ -8,7 +8,7 @@ The following features are supported by the FTP server:
 
 **Server**
 - NativeAOT support
-- Connection handler
+- Connection handler in Kestrel
 - Linux and Windows support
 - Custom path for FTP root directory
 - Auto disconnect client after idle time
