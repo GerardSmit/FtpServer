@@ -1,0 +1,33 @@
+﻿<Project Sdk="Microsoft.NET.Sdk.Web">
+
+    <PropertyGroup>
+        <TargetFramework>net8.0</TargetFramework>
+        <Nullable>enable</Nullable>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <IsAotCompatible>true</IsAotCompatible>
+        <WarningsAsErrors>true</WarningsAsErrors>
+        <EnableMicrosoftExtensionsConfigurationBinderSourceGenerator>true</EnableMicrosoftExtensionsConfigurationBinderSourceGenerator>
+        <EnableConfigurationBindingGenerator>true</EnableConfigurationBindingGenerator>
+        <GenerateMvcApplicationPartsAssemblyAttributes>false</GenerateMvcApplicationPartsAssemblyAttributes>
+        <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    </PropertyGroup>
+
+    <PropertyGroup Condition="'$(Sizoscope)' == 'true'">
+        <IlcGenerateMstatFile>true</IlcGenerateMstatFile>
+        <IlcGenerateDgmlFile>true</IlcGenerateDgmlFile>
+    </PropertyGroup>
+    
+    <PropertyGroup Condition="'$(Configuration)' == 'Release' and $(RuntimeIdentifier) != '' and $(PublishAot) == ''">
+        <PublishAot>true</PublishAot>
+    </PropertyGroup>
+
+    <!-- References -->
+    <ItemGroup>
+        <ProjectReference Include="..\FtpServer.SourceGenerator\FtpServer.SourceGenerator.csproj" OutputItemType="Analyzer" ReferenceOutputAssembly="false" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <PackageReference Include="Zio" Version="0.17.0" />
+    </ItemGroup>
+
+</Project>
