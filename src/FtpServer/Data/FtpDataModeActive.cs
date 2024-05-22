@@ -35,9 +35,11 @@ public sealed class FtpDataModeActive : FtpDataMode
 
         try
         {
-            await sslStream.AuthenticateAsClientAsync(new SslClientAuthenticationOptions
+            var certificate = session.RootServiceProvider.GetRequiredService<CertificateProvider>().GetCertificate();
+
+            await sslStream.AuthenticateAsServerAsync(new SslServerAuthenticationOptions
             {
-                RemoteCertificateValidationCallback = (sender, certificate, chain, errors) => true,
+                ServerCertificate = certificate
             }, token);
         }
         catch

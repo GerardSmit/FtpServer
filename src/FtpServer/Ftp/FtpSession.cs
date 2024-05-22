@@ -1,6 +1,7 @@
 ﻿using System.Buffers;
 using System.IO.Pipelines;
 using System.Net;
+using System.Net.Sockets;
 using System.Text;
 using FtpServer.Data;
 using FtpServer.Kestrel.Utils;
@@ -74,7 +75,7 @@ public sealed class FtpSession(
         return FlushAsync();
     }
 
-    public ValueTask WritePassiveModeAsync(ReadOnlySpan<byte> data, IPAddress address, int a, int b,  ReadOnlySpan<byte> suffix, CancellationToken token = default)
+    public ValueTask WritePassiveModeAsync(ReadOnlySpan<byte> data, IPAddress address, int a, int b, ReadOnlySpan<byte> suffix, CancellationToken token = default)
     {
         var length = data.Length +
                      15 + // Max length of an IP address
@@ -125,6 +126,45 @@ public sealed class FtpSession(
 
         suffix.CopyTo(span);
         totalWritten += suffix.Length;
+
+        Transport.Output.Advance(totalWritten);
+        return FlushAsync(token);
+    }
+
+    public ValueTask WriteExtendedPassiveModeAsync(ReadOnlySpan<byte> data, int port, ReadOnlySpan<byte> suffix, CancellationToken token = default)
+    {
+        // |||port|
+        var length = data.Length +
+                     3 + // Delimiters (3)
+                     4 + // Max length of port
+                     1 + // Delimiter (1)
+                     suffix.Length;
+
+        var buffer = Transport.Output.GetSpan(length);
+        var span = buffer;
+        data.CopyTo(span);
+
+        var totalWritten = data.Length;
+        span = span.Slice(data.Length);
+
+        span[0] = (byte)'|';
+        span[1] = (byte)'|';
+        span[2] = (byte)'|';
+
+        totalWritten += 3;
+        span = span.Slice(3);
+
+        if (!port.TryFormat(span, out var written))
+        {
+            throw new InvalidOperationException("Failed to format port number");
+        }
+
+        totalWritten += written;
+        span = span.Slice(written);
+
+        span[0] = (byte)'|';
+        suffix.CopyTo(span.Slice(1));
+        totalWritten += suffix.Length + 1;
 
         Transport.Output.Advance(totalWritten);
         return FlushAsync(token);

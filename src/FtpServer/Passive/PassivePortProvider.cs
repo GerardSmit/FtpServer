@@ -14,7 +14,7 @@ public class PassivePortProviderHostedService(PassivePortProvider passivePortPro
     public Task StopAsync(CancellationToken cancellationToken) => passivePortProvider.StopAllAsync();
 }
 
-public class PassivePortProvider(IOptions<FtpOptions> options, IHostApplicationLifetime hostApplicationLifetime)
+public class PassivePortProvider(IOptions<FtpOptions> options)
 {
     private readonly ConcurrentDictionary<int, PassiveSocket> _passiveSockets = new();
 
@@ -84,8 +84,9 @@ public class PassiveSocket(int port)
                 return;
             }
 
-            var socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-            socket.Bind(new IPEndPoint(IPAddress.Any, port));
+            var socket = new Socket(AddressFamily.InterNetworkV6, SocketType.Stream, ProtocolType.Tcp);
+            socket.SetSocketOption(SocketOptionLevel.IPv6, SocketOptionName.IPv6Only, false);
+            socket.Bind(new IPEndPoint(IPAddress.IPv6Any, port));
             socket.Listen(10);
             _backgroundTask = BackgroundTaskAsync(socket);
         }
