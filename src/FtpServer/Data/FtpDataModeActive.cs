@@ -3,7 +3,7 @@ using System.Net.Sockets;
 
 namespace FtpServer.Data;
 
-public sealed class ActiveFtpDataMode : FtpDataMode
+public sealed class FtpDataModeActive : FtpDataMode
 {
     public override async ValueTask<FtpStream> CreateDataChannelAsync(FtpSession session, CancellationToken token)
     {
@@ -35,10 +35,9 @@ public sealed class ActiveFtpDataMode : FtpDataMode
 
         try
         {
-            await sslStream.AuthenticateAsServerAsync(new SslServerAuthenticationOptions
+            await sslStream.AuthenticateAsClientAsync(new SslClientAuthenticationOptions
             {
-                ServerCertificate = session.CertificateProvider.GetCertificate(),
-
+                RemoteCertificateValidationCallback = (sender, certificate, chain, errors) => true,
             }, token);
         }
         catch

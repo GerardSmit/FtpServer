@@ -10,7 +10,7 @@ namespace FtpServer;
 
 public sealed class FtpSession(
     IDuplexPipe pipe,
-    CertificateProvider certificateProvider,
+    IServiceProvider provider,
     IFileSystem fileSystem
 ) : IDisposable
 {
@@ -22,7 +22,7 @@ public sealed class FtpSession(
 
     public IPEndPoint? ActiveDataIp { get; set; }
 
-    public CertificateProvider CertificateProvider => certificateProvider;
+    public IServiceProvider RootServiceProvider { get; } = provider;
 
     public IFileSystem FileSystem { get; } = fileSystem;
 
@@ -31,6 +31,10 @@ public sealed class FtpSession(
     public IDuplexPipe Transport { get; set; } = pipe;
 
     public FtpDataConnectionMode DataConnectionMode { get; set; } = FtpDataConnectionMode.Clear;
+
+    public EndPoint? RemoteEndPoint { get; set; }
+
+    public EndPoint? LocalEndPoint { get; set; }
 
     private ValueTask FlushAsync(CancellationToken token = default)
     {
@@ -61,12 +65,69 @@ public sealed class FtpSession(
         Transport.Output.Advance(data.Length + data2.Length + data3.Length);
         return FlushAsync();
     }
+
     public ValueTask WriteAsync(string data)
     {
         var buffer = Transport.Output.GetSpan(Encoding.GetMaxByteCount(data.Length));
         var length = Encoding.GetBytes(data, buffer);
         Transport.Output.Advance(length);
         return FlushAsync();
+    }
+
+    public ValueTask WritePassiveModeAsync(ReadOnlySpan<byte> data, IPAddress address, int a, int b,  ReadOnlySpan<byte> suffix, CancellationToken token = default)
+    {
+        var length = data.Length +
+                     15 + // Max length of an IP address
+                     5 + // Max length of a
+                     5 + // Max length of b
+                     suffix.Length;
+
+        var buffer = Transport.Output.GetSpan(length);
+        var span = buffer;
+        data.CopyTo(span);
+
+        var totalWritten = data.Length;
+        span = span.Slice(data.Length);
+
+        if (!address.TryFormat(span, out var written))
+        {
+            throw new InvalidOperationException("Failed to format IP address");
+        }
+
+        for (var i = 0; i < written; i++)
+        {
+            if (span[i] == '.')
+            {
+                span[i] = (byte)',';
+            }
+        }
+
+        totalWritten += written;
+        span = span.Slice(written);
+        span[0] = (byte)',';
+
+        if (!a.TryFormat(span.Slice(1), out written))
+        {
+            throw new InvalidOperationException("Failed to format port number");
+        }
+
+        totalWritten += written + 1;
+        span = span.Slice(written + 1);
+        span[0] = (byte)',';
+
+        if (!b.TryFormat(span.Slice(1), out written))
+        {
+            throw new InvalidOperationException("Failed to format port number");
+        }
+
+        totalWritten += written + 1;
+        span = span.Slice(written + 1);
+
+        suffix.CopyTo(span);
+        totalWritten += suffix.Length;
+
+        Transport.Output.Advance(totalWritten);
+        return FlushAsync(token);
     }
 
     public ValueTask WriteAsync(ReadOnlySpan<byte> prefix, string value, ReadOnlySpan<byte> suffix, CancellationToken token = default)

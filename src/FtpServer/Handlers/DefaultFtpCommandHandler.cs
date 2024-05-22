@@ -3,8 +3,12 @@ using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Globalization;
 using System.IO.Hashing;
+using System.Net;
+using System.Net.Security;
+using System.Net.Sockets;
 using System.Runtime.CompilerServices;
 using System.Text;
+using FtpServer.Data;
 using FtpServer.Extensions;
 using FtpServer.IO;
 using FtpServer.Options;
@@ -15,6 +19,7 @@ namespace FtpServer;
 
 public class DefaultFtpCommandHandler(
     PermissionProvider permissionProvider,
+    PassivePortProvider passivePortProvider,
     IOptions<FtpOptions> options
 ) : FtpCommandHandler
 {
@@ -347,9 +352,91 @@ public class DefaultFtpCommandHandler(
         return session.WriteAsync("230 User logged in, proceed.\r\n"u8);
     }
 
-    public override ValueTask PassiveModeAsync(FtpSession session, ReadOnlySequence<byte> data, CancellationToken token)
+    public override async ValueTask PassiveModeAsync(FtpSession session, ReadOnlySequence<byte> data, CancellationToken token)
     {
-        return base.PassiveModeAsync(session, data, token);
+        var remoteEndPoint = await GetIPv4AddressAsync(session, token);
+        var localEndPoint = await GetIPv4AddressAsync(session, token);
+
+        if (localEndPoint is null)
+        {
+            await session.WriteAsync("425 Can't open data connection.\r\n"u8);
+            return;
+        }
+
+        if (!passivePortProvider.TryRent(remoteEndPoint, out var socketOwner))
+        {
+            await session.WriteAsync("425 Can't open data connection.\r\n"u8);
+            return;
+        }
+
+        try
+        {
+            var port = await socketOwner.OpenPortAsync();
+
+            await session.WritePassiveModeAsync("227 Entering Passive Mode "u8, localEndPoint, port >> 8, port & 0xFF, "\r\n"u8, token);
+
+            var socket = await socketOwner.GetSocketAsync().WaitAsync(TimeSpan.FromSeconds(5), token);
+            var stream = new NetworkStream(socket, ownsSocket: true);
+
+            if (session.DataConnectionMode == FtpDataConnectionMode.Clear)
+            {
+                session.Mode = new FtpDataModePassive(stream, socket, socketOwner);
+                return;
+            }
+
+            var sslStream = new SslStream(stream, leaveInnerStreamOpen: false);
+
+            try
+            {
+                var certificateProvider = session.RootServiceProvider.GetRequiredService<CertificateProvider>();
+
+                await sslStream.AuthenticateAsServerAsync(new SslServerAuthenticationOptions
+                {
+                    ServerCertificate = certificateProvider.GetCertificate(),
+                }, token);
+            }
+            catch
+            {
+                await sslStream.DisposeAsync();
+                throw;
+            }
+
+            session.Mode = new FtpDataModePassive(sslStream, socket, socketOwner);
+        }
+        catch (TimeoutException)
+        {
+            await session.WriteAsync("425 Can't open data connection.\r\n"u8);
+            socketOwner.Dispose();
+        }
+        catch
+        {
+            socketOwner.Dispose();
+            throw;
+        }
+
+        return;
+
+        async ValueTask<IPAddress?> GetIPv4AddressAsync(FtpSession session, CancellationToken token)
+        {
+            var result = session.RemoteEndPoint switch
+            {
+                IPEndPoint ipEndPoint => ipEndPoint.Address,
+                DnsEndPoint dnsEndPoint => (await Dns.GetHostAddressesAsync(dnsEndPoint.Host, token)).FirstOrDefault(i => i.AddressFamily == AddressFamily.InterNetwork),
+                _ => throw new InvalidOperationException("Invalid endpoint type."),
+            };
+
+            if (result is null)
+            {
+                return null;
+            }
+
+            if (result.IsIPv4MappedToIPv6)
+            {
+                result = result.MapToIPv4();
+            }
+
+            return result.AddressFamily == AddressFamily.InterNetwork ? result : null;
+        }
     }
 
     public override ValueTask ProtectionBufferSizeAsync(FtpSession session, ReadOnlySequence<byte> data, CancellationToken token)

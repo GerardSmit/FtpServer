@@ -6,13 +6,13 @@ using Zio.FileSystems;
 namespace FtpServer;
 
 public class FtpSessionProvider(
-    IOptions<FtpOptions> options,
-    CertificateProvider certificateProvider)
+    IServiceProvider provider,
+    IOptions<FtpOptions> options)
 {
     public FtpSession CreateSession(IDuplexPipe pipe)
     {
         var fileSystem = new SubFileSystem(new PhysicalFileSystem(), options.Value.RootPath);
 
-        return new FtpSession(pipe, certificateProvider, fileSystem);
+        return new FtpSession(pipe, provider, fileSystem);
     }
 }

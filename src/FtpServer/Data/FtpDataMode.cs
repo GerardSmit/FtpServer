@@ -2,7 +2,7 @@
 
 public abstract class FtpDataMode
 {
-    public static readonly ActiveFtpDataMode Active = new ActiveFtpDataMode();
+    public static readonly FtpDataModeActive Active = new();
 
     public abstract ValueTask<FtpStream> CreateDataChannelAsync(FtpSession session, CancellationToken token);
 }

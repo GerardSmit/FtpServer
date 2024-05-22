@@ -25,6 +25,9 @@ public class FtpConnectionHandler(
         using var session = sessionProvider.CreateSession(connection.Transport);
         var token = connection.ConnectionClosed;
 
+        session.RemoteEndPoint = connection.RemoteEndPoint;
+        session.LocalEndPoint = connection.LocalEndPoint;
+
         await HandleConnection(connection.Transport, session, token);
     }
 

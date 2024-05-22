@@ -22,6 +22,8 @@ builder.Services.AddSingleton<CertificateProvider>();
 builder.Services.AddSingleton<PermissionProvider>();
 builder.Services.AddSingleton<FtpSessionProvider>();
 builder.Services.AddSingleton<FtpCommandHandler, DefaultFtpCommandHandler>();
+builder.Services.AddSingleton<PassivePortProvider>();
+builder.Services.AddHostedService<PassivePortProviderHostedService>();
 
 builder.Services.AddOptions<FtpOptions>()
     .Bind(builder.Configuration);
