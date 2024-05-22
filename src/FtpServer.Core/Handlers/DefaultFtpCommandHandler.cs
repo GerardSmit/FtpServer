@@ -191,15 +191,15 @@ public class DefaultFtpCommandHandler(
         if (options.Value.Features.LISTR && (data.SequenceEquals("-R"u8) || data.SequenceEquals("-r"u8)))
         {
             var results = new ConcurrentDictionary<UPath, string>();
-            var paths = session.FileSystem
-                .EnumerateDirectories(session.CurrentDirectory, "*", SearchOption.AllDirectories)
-                .ToArray();
+            var paths = new List<UPath>();
 
-            if (paths.Length > 0)
+            GetDirectories(paths, session.CurrentDirectory, options.Value.List.RecursionLimit);
+
+            if (paths.Count > 0)
             {
                 Parallel.For(
                     0,
-                    paths.Length,
+                    paths.Count,
                     new ParallelOptions
                     {
                         CancellationToken = token,
@@ -249,6 +249,20 @@ public class DefaultFtpCommandHandler(
 
         await session.WriteAsync("226 Transfer complete.\r\n"u8);
         return;
+
+        void GetDirectories(List<UPath> items, UPath path, int maxDepth, int depth = 0)
+        {
+            if (depth >= maxDepth)
+            {
+                return;
+            }
+
+            foreach (var item in session.FileSystem.EnumerateDirectories(path))
+            {
+                items.Add(item);
+                GetDirectories(items, item, maxDepth, depth + 1);
+            }
+        }
 
         void WriteDirectory(StringBuilder target, IEnumerable<FileSystemItem> items)
         {

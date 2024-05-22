@@ -11,6 +11,8 @@ public class FtpOptions
     public FtpFeatureOptions Features { get; set; } = new();
 
     public PassivePortRangeOptions PassivePortRange { get; set; } = new();
+
+    public FtpListOptions List { get; set; } = new();
 }
 
 public class FtpFeatureOptions
@@ -25,4 +27,12 @@ public class PassivePortRangeOptions
     public int Start { get; set; } = 50000;
 
     public int End { get; set; } = 50100;
+}
+
+public class FtpListOptions
+{
+    /// <summary>
+    /// Limit of the recursion depth for the "LIST -R" command.
+    /// </summary>
+    public int RecursionLimit { get; set; } = 10;
 }
