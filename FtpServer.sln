@@ -4,6 +4,12 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "FtpServer", "src\FtpServer\
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "FtpServer.SourceGenerator", "src\FtpServer.SourceGenerator\FtpServer.SourceGenerator.csproj", "{C42884B8-045F-4AA7-AB78-7522362833CB}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "FtpServer.Core", "src\FtpServer.Core\FtpServer.Core.csproj", "{1FBAD81B-244D-4E1F-96FF-5DDDBAD89D8C}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "FtpServer.Kestrel", "src\FtpServer.Kestrel\FtpServer.Kestrel.csproj", "{7FEE0AEA-893C-45BE-93F8-D98C9E04C952}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "FtpServer.Sockets", "src\FtpServer.Sockets\FtpServer.Sockets.csproj", "{3A382F34-DB34-4A25-9D48-29BEC9A07DCB}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -18,5 +24,17 @@ Global
 		{C42884B8-045F-4AA7-AB78-7522362833CB}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{C42884B8-045F-4AA7-AB78-7522362833CB}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{C42884B8-045F-4AA7-AB78-7522362833CB}.Release|Any CPU.Build.0 = Release|Any CPU
+		{1FBAD81B-244D-4E1F-96FF-5DDDBAD89D8C}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{1FBAD81B-244D-4E1F-96FF-5DDDBAD89D8C}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{1FBAD81B-244D-4E1F-96FF-5DDDBAD89D8C}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{1FBAD81B-244D-4E1F-96FF-5DDDBAD89D8C}.Release|Any CPU.Build.0 = Release|Any CPU
+		{7FEE0AEA-893C-45BE-93F8-D98C9E04C952}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{7FEE0AEA-893C-45BE-93F8-D98C9E04C952}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{7FEE0AEA-893C-45BE-93F8-D98C9E04C952}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{7FEE0AEA-893C-45BE-93F8-D98C9E04C952}.Release|Any CPU.Build.0 = Release|Any CPU
+		{3A382F34-DB34-4A25-9D48-29BEC9A07DCB}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{3A382F34-DB34-4A25-9D48-29BEC9A07DCB}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{3A382F34-DB34-4A25-9D48-29BEC9A07DCB}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{3A382F34-DB34-4A25-9D48-29BEC9A07DCB}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 EndGlobal

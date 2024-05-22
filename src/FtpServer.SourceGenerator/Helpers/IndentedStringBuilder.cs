@@ -37,7 +37,7 @@ public class IndentedStringBuilder
 
     public IndentedStringBuilder AppendLine()
     {
-        return AppendLine(Environment.NewLine);
+        return AppendLine("\n");
     }
 
     public IndentedStringBuilder Append(string text)

@@ -1,8 +1,9 @@
-﻿<Project Sdk="Microsoft.NET.Sdk.Web">
+﻿<Project Sdk="Microsoft.NET.Sdk">
 
     <PropertyGroup>
         <TargetFramework>net8.0</TargetFramework>
         <Nullable>enable</Nullable>
+        <OutputType>Exe</OutputType>
         <ImplicitUsings>enable</ImplicitUsings>
         <IsAotCompatible>true</IsAotCompatible>
         <WarningsAsErrors>true</WarningsAsErrors>
@@ -16,19 +17,21 @@
         <IlcGenerateMstatFile>true</IlcGenerateMstatFile>
         <IlcGenerateDgmlFile>true</IlcGenerateDgmlFile>
     </PropertyGroup>
-    
+
     <PropertyGroup Condition="'$(Configuration)' == 'Release' and $(RuntimeIdentifier) != '' and $(PublishAot) == ''">
         <PublishAot>true</PublishAot>
+        <InvariantGlobalization>true</InvariantGlobalization>
+        <UseSystemResourceKeys>true</UseSystemResourceKeys>
+        <OptimizationPreference>Size</OptimizationPreference>
+        <StackTraceSupport>false</StackTraceSupport>
     </PropertyGroup>
 
-    <!-- References -->
     <ItemGroup>
-        <ProjectReference Include="..\FtpServer.SourceGenerator\FtpServer.SourceGenerator.csproj" OutputItemType="Analyzer" ReferenceOutputAssembly="false" />
+      <ProjectReference Include="..\FtpServer.Sockets\FtpServer.Sockets.csproj" />
     </ItemGroup>
-
+    
     <ItemGroup>
-        <PackageReference Include="System.IO.Hashing" Version="8.0.0" />
-        <PackageReference Include="Zio" Version="0.17.0" />
+        <PackageReference Include="Microsoft.Extensions.Hosting" Version="8.0.0" />
     </ItemGroup>
 
 </Project>

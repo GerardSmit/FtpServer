@@ -8,22 +8,26 @@ The following features are supported by the FTP server:
 
 **Server**
 - NativeAOT support
-- Connection handler in Kestrel
 - Linux and Windows support
 - Custom path for FTP root directory
 - Auto disconnect client after idle time
 
 **FTP**
 - FTPS (FTP over SSL) support
-- Only active mode support
+- Active and Passive mode support
 - Basic FTP commands support
   - PWD
   - CWD
   - LIST
+  - LIST -R
   - RETR
   - STOR
   - PORT
+  - EPRT
   - PROT
+  - PASV
+  - EPSV
+  - XCRC
 
 More features will be added in the future.
 
