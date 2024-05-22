@@ -71,7 +71,12 @@ public class DefaultFtpCommandHandler(
 
     public override ValueTask ChangeToParentDirectoryAsync(FtpSession session, ReadOnlySequence<byte> data, CancellationToken token)
     {
-        return base.ChangeToParentDirectoryAsync(session, data, token);
+        if (session.CurrentDirectory != UPath.Root)
+        {
+            session.CurrentDirectory = session.CurrentDirectory.GetDirectory();
+        }
+
+        return session.WriteAsync("200 Command okay.\r\n"u8);
     }
 
     public override ValueTask ConfidentialityProtectionAsync(FtpSession session, ReadOnlySequence<byte> data, CancellationToken token)
@@ -114,7 +119,13 @@ public class DefaultFtpCommandHandler(
 
     public override ValueTask ExtendedPortAsync(FtpSession session, ReadOnlySequence<byte> data, CancellationToken token)
     {
-        return base.ExtendedPortAsync(session, data, token);
+        if (!data.TryGetExtendedPort(out var endPoint))
+        {
+            return session.WriteAsync("501 Syntax error in parameters or arguments.\r\n"u8);
+        }
+
+        session.ActiveDataIp = endPoint;
+        return session.WriteAsync("200 Command okay.\r\n"u8);
     }
 
     public override ValueTask ExtendedPassiveModeAsync(FtpSession session, ReadOnlySequence<byte> data, CancellationToken token)
@@ -127,6 +138,9 @@ public class DefaultFtpCommandHandler(
         var features = options.Value.Features;
 
         await session.WriteAsync("211-Features:\r\n"u8);
+
+        await session.WriteAsync(" EPRT\r\n"u8);
+        await session.WriteAsync(" MLST type*;size*;modify*;\r\n"u8);
 
         if (options.Value.Ftps)
         {

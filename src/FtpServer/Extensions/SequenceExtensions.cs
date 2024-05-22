@@ -2,6 +2,7 @@
 using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
 using System.Net;
+using System.Net.Sockets;
 using System.Text;
 using Zio;
 
@@ -154,6 +155,33 @@ public static class SequenceExtensions
         }
     }
 
+    public static bool TryGetIpAddress(this ReadOnlySequence<byte> data, [NotNullWhen(true)] out IPAddress? result)
+    {
+        Span<char> buffer = stackalloc char[39];
+
+        int length;
+
+        if (data.IsSingleSegment)
+        {
+            length = Encoding.UTF8.GetChars(data.First.Span, buffer);
+        }
+        else
+        {
+            Span<byte> temp = stackalloc byte[(int)data.Length];
+            data.CopyTo(temp);
+            length = Encoding.UTF8.GetChars(temp, buffer);
+        }
+
+        if (IPAddress.TryParse(buffer.Slice(0, length), out var ip))
+        {
+            result = ip;
+            return true;
+        }
+
+        result = default;
+        return false;
+    }
+
     public static bool TryGetXCRC(this ReadOnlySequence<byte> sequence, UPath root, Encoding encoding, out Crc32Request request)
     {
         scoped ReadOnlySpan<byte> buffer;
@@ -205,6 +233,55 @@ public static class SequenceExtensions
         }
 
         request = new Crc32Request(path, startValue, endValue);
+        return true;
+    }
+
+    public static bool TryGetExtendedPort(this ReadOnlySequence<byte> sequence, [NotNullWhen(true)] out IPEndPoint? result)
+    {
+        var reader = new SequenceReader<byte>(sequence);
+
+        if (!reader.TryRead(out var d))
+        {
+            result = default;
+            return false;
+        }
+
+        if (!reader.TryReadTo(out ReadOnlySequence<byte> netPrtSequence, d) ||
+            !netPrtSequence.TryGetInt32(out var netPrt))
+        {
+            result = default;
+            return false;
+        }
+
+        if (!reader.TryReadTo(out ReadOnlySequence<byte> netAddrSequence, d) ||
+            !netAddrSequence.TryGetIpAddress(out var ipAddress))
+        {
+            result = default;
+            return false;
+        }
+
+        var expectedAddressFamily = netPrt switch
+        {
+            1 => AddressFamily.InterNetwork,
+            2 => AddressFamily.InterNetworkV6,
+            _ => AddressFamily.Unknown
+        };
+
+        if (ipAddress.AddressFamily != expectedAddressFamily)
+        {
+            result = default;
+            return false;
+        }
+
+
+        if (!reader.TryReadTo(out ReadOnlySequence<byte> portSequence, d) ||
+            !portSequence.TryGetInt32(out var port))
+        {
+            result = default;
+            return false;
+        }
+
+        result = new IPEndPoint(ipAddress, port);
         return true;
     }
 }
