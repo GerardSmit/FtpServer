@@ -1,5 +1,6 @@
 ﻿using System.Buffers;
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Globalization;
 using System.IO.Hashing;
 using System.Net;
@@ -12,6 +13,7 @@ using FtpServer.Extensions;
 using FtpServer.IO;
 using FtpServer.Options;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Zio;
 
@@ -20,11 +22,14 @@ namespace FtpServer.Handlers;
 public class DefaultFtpCommandHandler(
     PermissionProvider permissionProvider,
     PassivePortProvider passivePortProvider,
-    IOptions<FtpOptions> options
+    IOptions<FtpOptions> options,
+    ILogger<DefaultFtpCommandHandler> logger
 ) : FtpCommandHandler
 {
     protected override ValueTask UnknownAsync(FtpSession session, FtpCommand command, ReadOnlySequence<byte> data, CancellationToken token)
     {
+        Log.UnhandledCommand(logger, command.ToCommand());
+
         return session.WriteAsync("502 Command not implemented.\r\n"u8);
     }
 
@@ -414,6 +419,12 @@ public class DefaultFtpCommandHandler(
         Func<FtpSession, IPAddress, int, CancellationToken, ValueTask> openPort,
         CancellationToken token)
     {
+        if (!options.Value.Passive)
+        {
+            await session.WriteAsync("502 Command not implemented.\r\n"u8);
+            return;
+        }
+
         var remoteEndPoint = await getAddress(session.RemoteEndPoint, token);
         var localEndPoint = await getAddress(session.LocalEndPoint, token);
 
@@ -431,11 +442,16 @@ public class DefaultFtpCommandHandler(
 
         try
         {
-            var port = await socketOwner.OpenPortAsync();
-
-            await openPort(session, localEndPoint, port, token);
+            var sw = Stopwatch.StartNew();
+            await openPort(session, localEndPoint, socketOwner.Port, token);
 
             var socket = await socketOwner.GetSocketAsync().WaitAsync(TimeSpan.FromSeconds(3), token);
+
+            if (logger.IsEnabled(LogLevel.Debug))
+            {
+                Log.PassiveConnectionAccepted(logger, remoteEndPoint, sw.Elapsed.TotalMilliseconds);
+            }
+
             var stream = new NetworkStream(socket, ownsSocket: true);
 
             if (session.DataConnectionMode == FtpDataConnectionMode.Clear)
@@ -671,7 +687,7 @@ public class DefaultFtpCommandHandler(
 
     public override ValueTask SystemTypeAsync(FtpSession session, ReadOnlySequence<byte> data, CancellationToken token)
     {
-        return base.SystemTypeAsync(session, data, token);
+        return session.WriteAsync("215 UNIX Type: L8.\r\n"u8);
     }
 
     public override ValueTask GetThumbnailAsync(FtpSession session, ReadOnlySequence<byte> data, CancellationToken token)

@@ -23,12 +23,12 @@ public readonly record struct FtpRequest(FtpCommand Command, ReadOnlySequence<by
             Span<byte> commandSpan = stackalloc byte[(int)commandBytes.Length];
             commandBytes.CopyTo(commandSpan);
 
-            command = FtpCommandExtensions.FromUtf8(commandSpan.Slice(0, commandSpan.Length - 2));
-            data = reader.UnreadSequence.Slice(0, reader.Remaining - 3);
+            command = FtpCommandExtensions.FromUtf8(commandSpan);
+            data = reader.UnreadSequence.Slice(0, reader.Remaining - 2);
         }
         else
         {
-            Span<byte> commandSpan = stackalloc byte[(int)line.Length];
+            Span<byte> commandSpan = stackalloc byte[(int)line.Length - 2];
 
             line.CopyTo(commandSpan);
 

@@ -49,7 +49,7 @@ public class FtpCommandSourceGenerator : IIncrementalGenerator
                         sb.AppendLine($"FtpCommand.{value.Name} => \"{value.Code}\",");
                     }
 
-                    sb.AppendLine("_ => throw new ArgumentOutOfRangeException(nameof(name), name, null)");
+                    sb.AppendLine("_ => \"UNKNOWN\"");
                 }
             }
 

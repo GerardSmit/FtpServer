@@ -4,9 +4,11 @@ public class FtpOptions
 {
     public int Port { get; set; } = 21;
 
-    public string RootPath { get; set; } = "/";
+    public string Path { get; set; } = "/";
 
-    public bool Ftps { get; set; } = false;
+    public bool Ftps { get; set; }
+
+    public bool Passive { get; set; }
 
     public FtpFeatureOptions Features { get; set; } = new();
 

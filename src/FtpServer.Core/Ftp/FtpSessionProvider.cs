@@ -12,12 +12,18 @@ public class FtpSessionProvider(
 {
     public FtpSession CreateSession(IDuplexPipe pipe)
     {
-        var rootPath = options.Value.RootPath;
+        var rootPath = options.Value.Path;
         IFileSystem fileSystem = new PhysicalFileSystem();
+
+        if (OperatingSystem.IsWindows() && rootPath.Length > 1 && rootPath[1] == ':')
+        {
+            // Convert Windows path to Unix path
+            rootPath = fileSystem.ConvertPathFromInternal(rootPath).FullName;
+        }
 
         if (rootPath != UPath.Root)
         {
-            fileSystem = new SubFileSystem(fileSystem, options.Value.RootPath);
+            fileSystem = new SubFileSystem(fileSystem, rootPath);
         }
 
         return new FtpSession(pipe, provider, fileSystem);

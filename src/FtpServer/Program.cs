@@ -10,9 +10,10 @@ var builder = Host.CreateEmptyApplicationBuilder(new HostApplicationBuilderSetti
     Args = args
 });
 
+
 builder.Logging.AddConsole();
 builder.Configuration.AddCommandLine(args);
-builder.Configuration.AddEnvironmentVariables();
+builder.Configuration.AddEnvironmentVariables("FTP_");
 builder.Configuration.AddJsonFile("appsettings.json", optional: true);
 builder.Configuration.AddJsonFile("appsettings.Development.json", optional: true);
 

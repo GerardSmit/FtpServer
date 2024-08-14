@@ -1,20 +1,22 @@
 ﻿using System.Buffers;
+using System.Diagnostics;
 using System.IO.Pipelines;
 using System.Net.Security;
 using System.Runtime.CompilerServices;
 using FtpServer.Options;
 using FtpServer.Pipelines;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
 namespace FtpServer.Handlers;
 
-public class FtpConnectionHandler(
+public partial class FtpConnectionHandler(
     IHostApplicationLifetime lifetime,
     CertificateProvider provider,
     FtpCommandHandler handler,
-    IOptions<FtpOptions> options
-)
+    IOptions<FtpOptions> options,
+    ILogger<FtpConnectionHandler> logger)
 {
     private static readonly StreamPipeReaderOptions SslReaderOptions = new(leaveOpen: true);
     private static readonly StreamPipeWriterOptions SslWriterOptions = new(leaveOpen: true);
@@ -46,10 +48,16 @@ public class FtpConnectionHandler(
                 buffer = result.Buffer;
                 hasBuffer = true;
 
+                if (buffer.Length == 0)
+                {
+                    break;
+                }
+
                 while (TryGetLine("\r\n"u8, buffer, out var position))
                 {
                     var line = result.Buffer.Slice(0, position);
                     var (command, data) = FtpRequest.Parse(line);
+                    var sw = Stopwatch.StartNew();
 
                     if (command == FtpCommand.AuthenticationSecurityMechanism)
                     {
@@ -81,11 +89,20 @@ public class FtpConnectionHandler(
 
                     await handler.HandleAsync(session, command, data, cts.Token);
                     buffer = buffer.Slice(position);
+
+                    if (logger.IsEnabled(LogLevel.Debug))
+                    {
+                        Log.IncomingRequest(logger, command, command.ToCommand(), sw.Elapsed.TotalMilliseconds);
+                    }
                 }
             }
             catch (OperationCanceledException)
             {
                 break;
+            }
+            catch(Exception ex)
+            {
+                Log.RequestException(logger, ex);
             }
             finally
             {
@@ -147,19 +164,33 @@ public class FtpConnectionHandler(
         return sslDuplex;
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static bool TryGetLine(in ReadOnlySpan<byte> span, in ReadOnlySequence<byte> result, out SequencePosition position)
     {
-        foreach (var buffer in result)
+        if (!result.IsSingleSegment)
         {
-            var index = buffer.Span.IndexOf(span);
+            return TryGetLineMultiSegment(span, result, out position);
+        }
 
-            if (index == -1)
-            {
-                continue;
-            }
+        var index = result.First.Span.IndexOf(span);
 
-            position = result.GetPosition(index + 2);
+        if (index != -1)
+        {
+            position = result.GetPosition(index + span.Length, result.Start);
+            return true;
+        }
+
+        position = default;
+        return false;
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static bool TryGetLineMultiSegment(in ReadOnlySpan<byte> span, in ReadOnlySequence<byte> result, out SequencePosition position)
+    {
+        var reader = new SequenceReader<byte>(result);
+
+        if (reader.TryReadTo(out ReadOnlySequence<byte> _, span))
+        {
+            position = reader.Position;
             return true;
         }
 

@@ -13,21 +13,25 @@ public class PassiveSocket(int port, ILogger<PassiveSocket> logger)
     private PassiveSocketOwner? _globalSocketOwner;
     private Task? _backgroundTask;
     private readonly CancellationTokenSource _cancellationTokenSource = new();
+    private bool _invalid;
 
-    public async ValueTask<int> OpenPortAsync()
-    {
-        await StartListeningAsync();
-        return port;
-    }
+    public int Port => port;
 
-    private async ValueTask StartListeningAsync()
+    private void StartListening()
     {
         if (_backgroundTask != null)
         {
+            // Already listening
             return;
         }
 
-        await _semaphore.WaitAsync();
+        if (_invalid)
+        {
+            // Socket is invalid, don't start listening again
+            return;
+        }
+
+        _semaphore.Wait();
 
         try
         {
@@ -43,6 +47,13 @@ public class PassiveSocket(int port, ILogger<PassiveSocket> logger)
             socket.Bind(new IPEndPoint(IPAddress.IPv6Any, port));
             socket.Listen(10);
             _backgroundTask = BackgroundTaskAsync(socket);
+        }
+        catch (Exception e)
+        {
+            // Most likely the port is already in use
+            _invalid = true;
+
+            Log.CouldNotStartPassiveSocket(logger, e);
         }
         finally
         {
@@ -94,7 +105,7 @@ public class PassiveSocket(int port, ILogger<PassiveSocket> logger)
             }
             catch(Exception ex)
             {
-                logger.LogWarning(ex, "Error accepting passive socket");
+                Log.CouldNotAcceptPassiveSocket(logger, ex);
             }
         }
 
@@ -160,6 +171,14 @@ public class PassiveSocket(int port, ILogger<PassiveSocket> logger)
 
     public bool TryRent(IPAddress? targetAddress, [NotNullWhen(true)] out PassiveSocketOwner? socketOwner)
     {
+        if (_invalid)
+        {
+            socketOwner = null;
+            return false;
+        }
+
+        StartListening();
+
         // Global IP adres
         if (targetAddress == null)
         {

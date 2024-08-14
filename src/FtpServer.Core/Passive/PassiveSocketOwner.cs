@@ -9,7 +9,7 @@ public sealed class PassiveSocketOwner(IPAddress? targetAddress, PassiveSocket p
 
     public void Dispose() => passiveSocket.Release(targetAddress);
 
-    public ValueTask<int> OpenPortAsync() => passiveSocket.OpenPortAsync();
+    public int Port => passiveSocket.Port;
 
     public Task<Socket> GetSocketAsync() => _socketCompletionSource.Task;
 
