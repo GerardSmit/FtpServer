@@ -187,6 +187,101 @@ public class ContainmentTests
     }
 
     [Fact]
+    public void Resolution_below_a_resolved_prefix_still_follows_a_link_under_it()
+    {
+        var outside = Path.Combine(Path.GetTempPath(), "ftpescape-" + Guid.NewGuid().ToString("N")[..8]);
+        var root = Path.Combine(Path.GetTempPath(), "ftproot-" + Guid.NewGuid().ToString("N")[..8]);
+
+        Directory.CreateDirectory(Path.Combine(outside, "deep"));
+        Directory.CreateDirectory(Path.Combine(root, "plain"));
+
+        try
+        {
+            if (!TryCreateDirectoryLink(Path.Combine(root, "plain", "link"), outside))
+            {
+                return;
+            }
+
+            // Skipping the prefix's own components must not skip the ones beneath it.
+            var resolved = NoFollowPhysicalFileSystem.ResolveLinks(
+                Path.Combine(root, "plain", "link", "deep", "file.txt"),
+                Path.GetFullPath(root));
+
+            Assert.StartsWith(outside, resolved, StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            RemoveLink(Path.Combine(root, "plain", "link"));
+
+            try
+            {
+                Directory.Delete(root, recursive: true);
+                Directory.Delete(outside, recursive: true);
+            }
+            catch (IOException)
+            {
+                // Left for the OS to clean up.
+            }
+        }
+    }
+
+    [Fact]
+    public async Task Dangling_link_out_of_the_root_is_refused_for_creation()
+    {
+        await using var server = await FtpServerFixture.StartAsync();
+
+        // The target does not exist, so an existence check alone would see nothing at the link
+        // and wave the path through - after which STOR or MKD would create the target.
+        var outside = Path.Combine(Path.GetTempPath(), "ftpdangling-" + Guid.NewGuid().ToString("N")[..8]);
+        var link = Path.Combine(server.Root, "dangling");
+
+        Directory.CreateDirectory(outside);
+
+        try
+        {
+            if (!TryCreateDirectoryLink(link, outside))
+            {
+                return;
+            }
+
+            Directory.Delete(outside);
+
+            await using var client = await server.LoginAsync();
+
+            Assert.StartsWith("550", await client.SendAsync("STOR dangling/created.txt"));
+            Assert.StartsWith("550", await client.SendAsync("MKD dangling/created"));
+            Assert.False(Directory.Exists(outside), "nothing may be created outside the root");
+        }
+        finally
+        {
+            RemoveLink(link);
+
+            if (Directory.Exists(outside))
+            {
+                Directory.Delete(outside, recursive: true);
+            }
+        }
+    }
+
+    [Fact]
+    public void A_path_under_a_missing_component_resolves_to_itself()
+    {
+        var root = Path.GetFullPath(Path.Combine(Path.GetTempPath(), "ftproot-" + Guid.NewGuid().ToString("N")[..8]));
+        Directory.CreateDirectory(root);
+
+        try
+        {
+            var path = Path.Combine(root, "missing", "deeper", "file.txt");
+
+            Assert.Equal(path, NoFollowPhysicalFileSystem.ResolveLinks(path, root));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
     public void A_path_with_no_links_resolves_to_itself()
     {
         var root = Path.Combine(Path.GetTempPath(), "ftproot-" + Guid.NewGuid().ToString("N")[..8]);

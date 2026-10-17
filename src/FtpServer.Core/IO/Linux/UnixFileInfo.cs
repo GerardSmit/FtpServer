@@ -1,10 +1,55 @@
+using System.Collections.Concurrent;
 using System.Runtime.InteropServices;
 
 namespace FtpServer.IO;
 
 public static partial class UnixFileInfo
 {
-    public static string GetUserName(uint uid)
+    /// <summary>Bounds each name cache; cleared wholesale rather than tracking recency.</summary>
+    private const int NameCapacity = 1024;
+
+    /// <summary>
+    /// Names already looked up. A listing names the same few owners on every line, and each
+    /// lookup goes through NSS, which may be LDAP or another network service.
+    /// </summary>
+    private static readonly ConcurrentDictionary<uint, string> UserNames = new();
+
+    private static readonly ConcurrentDictionary<uint, string> GroupNames = new();
+
+    /// <summary>
+    /// getpwuid and getgrgid return a pointer into a static buffer that the next call overwrites,
+    /// so concurrent sessions must not interleave between the call and the copy.
+    /// </summary>
+    private static readonly Lock LookupGate = new();
+
+    public static string GetUserName(uint uid) => GetCached(UserNames, uid, LookUpUserName);
+
+    public static string GetGroupName(uint gid) => GetCached(GroupNames, gid, LookUpGroupName);
+
+    private static string GetCached(ConcurrentDictionary<uint, string> cache, uint id, Func<uint, string> lookUp)
+    {
+        if (cache.TryGetValue(id, out var cached))
+        {
+            return cached;
+        }
+
+        string name;
+
+        lock (LookupGate)
+        {
+            name = lookUp(id);
+        }
+
+        if (cache.Count >= NameCapacity)
+        {
+            cache.Clear();
+        }
+
+        cache[id] = name;
+        return name;
+    }
+
+    private static string LookUpUserName(uint uid)
     {
         var pwd = getpwuid(uid);
         if (pwd == IntPtr.Zero)
@@ -16,7 +61,7 @@ public static partial class UnixFileInfo
         return passwd.pw_name;
     }
 
-    public static string GetGroupName(uint gid)
+    private static string LookUpGroupName(uint gid)
     {
         var grp = getgrgid(gid);
         if (grp == IntPtr.Zero)
