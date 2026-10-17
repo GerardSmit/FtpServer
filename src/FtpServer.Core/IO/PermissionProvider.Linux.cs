@@ -1,4 +1,5 @@
-﻿using System.Runtime.Versioning;
+﻿using System.Collections.Concurrent;
+using System.Runtime.Versioning;
 using FtpServer.IO.Results;
 using Zio;
 
@@ -7,7 +8,7 @@ namespace FtpServer.IO;
 public partial class PermissionProvider
 {
     [UnsupportedOSPlatform("windows")]
-    private FilePermissionResult GetFilePermissionsUnix(in FileSystemItem item, string path)
+    private FilePermissionResult GetFilePermissionsUnix(in FileSystemItem item, string path, bool includeNames)
     {
         var mode = File.GetUnixFileMode(path);
 
@@ -29,10 +30,10 @@ public partial class PermissionProvider
         string? owner;
         string? group;
 
-        if (NativeMethods.stat(path, out var stat) == 0)
+        if (includeNames && NativeMethods.stat(path, out var stat) == 0)
         {
-            owner = UnixFileInfo.GetUserName(stat.st_uid);
-            group = UnixFileInfo.GetGroupName(stat.st_gid);
+            owner = GetCachedName(_userNames, stat.st_uid, UnixFileInfo.GetUserName);
+            group = GetCachedName(_groupNames, stat.st_gid, UnixFileInfo.GetGroupName);
         }
         else
         {
@@ -41,5 +42,18 @@ public partial class PermissionProvider
         }
 
         return new FilePermissionResult(userResult, groupResult, otherResult, owner, group);
+    }
+
+    /// <summary>getpwuid/getgrgid read the user and group databases, possibly over NSS/LDAP.</summary>
+    private static string GetCachedName(ConcurrentDictionary<uint, string> cache, uint id, Func<uint, string> lookup)
+    {
+        if (cache.TryGetValue(id, out var cached))
+        {
+            return cached;
+        }
+
+        var name = lookup(id);
+        CacheName(cache, id, name);
+        return name;
     }
 }

@@ -54,6 +54,12 @@ public partial class DefaultFtpCommandHandler
             return;
         }
 
+        // With recursion switched off "-R" is one more presentation flag, like "-a".
+        if (request.Recursive && !options.Current.Features.LISTR)
+        {
+            request = request with { Recursive = false };
+        }
+
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(token);
         session.TransferCancellation = cts;
 

@@ -223,9 +223,10 @@ public class ReviewFixTests
         await client.SendAsync("REST 4");
 
         // RFC 3659 section 5.3: an accepted restart marker makes APPE act exactly as STOR would,
-        // so the data lands at the marker instead of at the end.
+        // so the data lands at the marker instead of at the end - and, as with STOR, the file
+        // ends where the resumed data does.
         Assert.Contains("226", await client.UploadAsync("APPE file.txt", "ABC"u8.ToArray()), StringComparison.Ordinal);
-        Assert.Equal("0123ABC789", File.ReadAllText(Path.Combine(server.Root, "file.txt")));
+        Assert.Equal("0123ABC", File.ReadAllText(Path.Combine(server.Root, "file.txt")));
     }
 
     // ---- FTP-008/017: MLSx facts ------------------------------------------

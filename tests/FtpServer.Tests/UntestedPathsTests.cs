@@ -138,15 +138,61 @@ public class AsciiModeTests
     }
 
     [Fact]
-    public async Task Restart_is_refused_in_ascii_mode()
+    public async Task Restart_is_accepted_in_ascii_mode_but_refused_at_transfer_time()
     {
         await using var server = await FtpServerFixture.StartAsync();
+        server.WriteFile("x.txt", "0123456789");
 
         await using var client = await server.LoginAsync();
         await client.SendAsync("TYPE A");
 
-        // 504, not 451: refusing the parameter is permanent, and 451 would invite a retry.
-        Assert.StartsWith("504", await client.SendAsync("REST 5"));
+        // Indy's TIdFTP (Beyond Compare) probes resume support with "REST 1" while the session
+        // is still in the default TYPE A; a 504 there made it conclude the server cannot resume.
+        Assert.StartsWith("350", await client.SendAsync("REST 5"));
+
+        // A marker still in TYPE A when the transfer starts would count translated octets, so it
+        // is refused with RFC 959's "invalid REST parameter" - before the 150, not after.
+        using var data = await client.OpenPassiveAsync();
+        var reply = await client.SendAsync("RETR x.txt", 600);
+
+        Assert.StartsWith("554", reply);
+        Assert.DoesNotContain("150", reply);
+    }
+
+    [Fact]
+    public async Task Restart_set_in_ascii_mode_applies_after_switching_to_image()
+    {
+        await using var server = await FtpServerFixture.StartAsync();
+        server.WriteFile("x.txt", "0123456789");
+
+        await using var client = await server.LoginAsync();
+
+        Assert.StartsWith("350", await client.SendAsync("REST 1"));
+        Assert.StartsWith("350", await client.SendAsync("REST 0"));
+        Assert.StartsWith("350", await client.SendAsync("REST 6"));
+        await client.SendAsync("TYPE I");
+
+        var (bytes, control) = await client.DownloadAsync("RETR x.txt");
+
+        Assert.Equal("6789", Encoding.ASCII.GetString(bytes));
+        Assert.Contains("226", control);
+    }
+
+    [Fact]
+    public async Task Restart_zero_in_ascii_mode_transfers_normally()
+    {
+        await using var server = await FtpServerFixture.StartAsync();
+        server.WriteFile("x.txt", "abc");
+
+        await using var client = await server.LoginAsync();
+        await client.SendAsync("TYPE A");
+
+        Assert.StartsWith("350", await client.SendAsync("REST 0"));
+
+        var (bytes, control) = await client.DownloadAsync("RETR x.txt");
+
+        Assert.Equal("abc", Encoding.ASCII.GetString(bytes));
+        Assert.Contains("226", control);
     }
 }
 
@@ -289,8 +335,39 @@ public class RemainingCommandTests
 
         var reply = await client.SendAsync("SITE CHMOD 640 mode.txt");
 
-        // Windows has no Unix mode bits, and saying "200" there would be a lie.
+        // Windows has no Unix mode bits; by default the 200 says the mode was ignored, so clients
+        // that copy permissions on upload do not report every transfer as failed.
+        Assert.StartsWith("200", reply);
+
+        if (OperatingSystem.IsWindows())
+        {
+            Assert.Contains("ignored", reply);
+        }
+    }
+
+    [Fact]
+    public async Task Site_chmod_can_be_strict_where_unsupported()
+    {
+        await using var server = await FtpServerFixture.StartAsync(o => o.Features.IgnoreUnsupportedChmod = false);
+        server.WriteFile("mode.txt", "x");
+
+        await using var client = await server.LoginAsync();
+
+        var reply = await client.SendAsync("SITE CHMOD 640 mode.txt");
+
+        // The option only matters where there are no mode bits to set.
         Assert.StartsWith(OperatingSystem.IsWindows() ? "504" : "200", reply);
+    }
+
+    [Fact]
+    public async Task Site_chmod_still_validates_its_argument_when_ignored()
+    {
+        await using var server = await FtpServerFixture.StartAsync();
+
+        await using var client = await server.LoginAsync();
+
+        Assert.StartsWith("501", await client.SendAsync("SITE CHMOD 9z9 mode.txt"));
+        Assert.StartsWith("550", await client.SendAsync("SITE CHMOD 644 missing.txt"));
     }
 
     [Fact]

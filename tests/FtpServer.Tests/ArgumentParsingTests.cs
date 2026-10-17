@@ -89,6 +89,28 @@ public class ArgumentParsingTests
     }
 
     [Theory]
+    [InlineData("a,b.txt")]
+    [InlineData("report 2023")]
+    [InlineData("report 0 5")]
+    public void Checksum_argument_prefers_an_existing_file_over_the_range_heuristic(string argument)
+    {
+        var expected = UPath.Root / argument;
+
+        Assert.True(Seq(argument).TryGetChecksumRequest(UPath.Root, Encoding.ASCII, out var request, path => path == expected));
+        Assert.Equal(expected, request.Path);
+        Assert.Null(request.Start);
+        Assert.Null(request.End);
+    }
+
+    [Fact]
+    public void Checksum_argument_falls_back_to_the_range_when_no_such_file_exists()
+    {
+        Assert.True(Seq("report 2023").TryGetChecksumRequest(UPath.Root, Encoding.ASCII, out var request, _ => false));
+        Assert.Equal(UPath.Root / "report", request.Path);
+        Assert.Equal(2023L, request.End);
+    }
+
+    [Theory]
     [InlineData("file.txt,5,1")]  // start after end
     [InlineData("file.txt,x,y")]
     [InlineData("")]

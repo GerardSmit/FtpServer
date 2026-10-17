@@ -37,7 +37,7 @@ FTP(S) server implementation in C# / .NET
 | Navigation | `CWD` `CDUP` `PWD` `MKD` `RMD` `RMDA` `DELE` `RNFR` `RNTO` `XCUP` `XMKD` `XPWD` `XRMD` |
 | Transfer setup | `TYPE` `MODE` `STRU` `ALLO` `REST` `PORT` `EPRT` `LPRT` `PASV` `EPSV` `LPSV` |
 | Transfers | `RETR` `STOR` `STOU` `APPE` `ABOR` |
-| Listings | `LIST` (incl. `-R` and a pathname) `NLST` `MLSD` `MLST` `STAT` |
+| Listings | `LIST` (incl. `-R` unless `Features.LISTR` is off, and a pathname) `NLST` `MLSD` `MLST` `STAT` |
 | Metadata | `SIZE` `MDTM` `MFMT` `AVBL` `DSIZ` |
 | Checksums | `HASH` `RANG` `XCRC` `XMD5` `XSHA1` `XSHA256` `XSHA512` |
 | Informational | `FEAT` `OPTS` `HELP` `SYST` `NOOP` `SITE` (`CHMOD`/`HELP`/`UTIME`) `LANG` `CLNT` `CSID` |
@@ -50,6 +50,32 @@ Exercised by an integration suite that drives the protocol at the byte level, an
 independent client implementations in CI: `curl` (plain and explicit FTPS, including `REST`
 resume and `NLST`) and `System.Net.FtpWebRequest`. FileZilla and WinSCP have **not** been tested;
 the commands they rely on are covered individually, but nobody has driven a real session with them.
+Beyond Compare 4 (Indy's `TIdFTP`) has been checked against the command sequence it sends and the
+replies it accepts, again without a live session.
+
+### Client compatibility notes
+
+Where the RFCs leave room, the server answers the way common clients expect:
+
+- **`XCRC`/`XMD5`/`XSHA*` answer `250 <HEX>`**, the bare upper-case digest and nothing after it.
+  That is the de-facto form, and the only one Indy-based clients such as Beyond Compare accept.
+  `HASH` keeps its `213 <algorithm> <range> <digest> <path>` reply. When the whole argument names an
+  existing file it is used as the pathname as-is, so names like `a,b.txt` or `report 2023` are not
+  mistaken for a path plus a byte range.
+- **`REST` is accepted in either `TYPE`.** The marker applies to the next `RETR`/`STOR`/`APPE`; if
+  that transfer is still in `TYPE A` with a nonzero marker it is refused with `554` before any
+  `150`, because an offset into the translated stream does not map onto the file. Clients that
+  probe for resume support with `REST 1` while still in the default `TYPE A` see `350`.
+- **A resumed `STOR` truncates the file at the end of the new data**, so nothing stale is left
+  behind it. A marker past the end of the file (or for a file that does not exist) is refused with
+  `554` before the `150`.
+- **MLSx facts default to `type;size;modify;perm;UNIX.mode`.** `UNIX.owner` and `UNIX.group` are
+  supported but off until a client asks for them with `OPTS MLST`: they cost an account lookup, and
+  clients that never send `OPTS MLST` would pay for facts they do not parse. On Windows `perm` is
+  derived from the session's access and the read-only attribute, not from the file's ACL.
+- **`SITE CHMOD` on Windows answers `200` and changes nothing**, saying so in the reply text.
+  Clients that copy permissions on upload (Beyond Compare does by default) would otherwise report
+  every upload as failed. Set `Features.IgnoreUnsupportedChmod` to `false` for a `504` instead.
 
 ## Configuration
 
@@ -108,6 +134,15 @@ command line — later sources win.
     "Password": null,
     "AllowTlsResume": true       // leave on: clients may require the data connection
                                  // to resume the control connection's TLS session
+  },
+
+  "Features": {
+    "XCRC": true,                // XCRC/XMD5/XSHA1/XSHA256/XSHA512
+    "LISTR": true,               // honour LIST -R; off ignores the flag
+    "MLST": true,
+    "Hash": true,                // HASH
+    "Site": true,                // SITE CHMOD/HELP/UTIME
+    "IgnoreUnsupportedChmod": true  // Windows: SITE CHMOD answers 200 as a no-op, not 504
   }
 }
 ```
@@ -195,6 +230,9 @@ server instead, because there is nothing to fall back on.
   the tree cannot be used to read or write outside it. `FollowLinks: true` turns that off, for a
   root deliberately assembled out of links. Neither setting affects hard links, which have no
   target to refuse to follow — keep the root on a filesystem no untrusted account can write to.
+  The root's own location is resolved at startup and re-checked at most once a second, rather than
+  on every operation: if a directory at or above the root is swapped for a link, the server
+  notices within that second and then refuses everything until the root lands where it did.
 - **Store passwords as `PasswordHash`.** `Password` and `PasswordSha256` are kept for existing
   configurations and warn at startup: an unsalted digest can be cracked offline at billions of
   guesses a second if the configuration ever leaks. `FtpServer user add` always writes the hashed

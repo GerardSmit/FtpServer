@@ -267,6 +267,10 @@ public class FtpFeatureOptions
 {
     public bool XCRC { get; set; } = true;
 
+    /// <summary>
+    /// Honour "LIST -R". When off the flag is ignored and only the named directory is listed,
+    /// which caps what one command can make the server walk.
+    /// </summary>
     public bool LISTR { get; set; } = true;
 
     public bool MLST { get; set; } = true;
@@ -277,6 +281,17 @@ public class FtpFeatureOptions
     /// Advertise and honour SITE sub-commands (CHMOD, UTIME, HELP).
     /// </summary>
     public bool Site { get; set; } = true;
+
+    /// <summary>
+    /// On a host without Unix mode bits (Windows), answer SITE CHMOD with 200 and change nothing,
+    /// rather than 504.
+    /// </summary>
+    /// <remarks>
+    /// On by default because clients that copy permissions on upload - Beyond Compare does unless
+    /// told otherwise - send CHMOD after every STOR and report each refusal as a failed transfer.
+    /// The 200 says plainly that the mode was ignored.
+    /// </remarks>
+    public bool IgnoreUnsupportedChmod { get; set; } = true;
 }
 
 public class PassivePortRangeOptions

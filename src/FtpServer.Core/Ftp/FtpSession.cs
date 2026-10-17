@@ -461,5 +461,13 @@ public enum MlsxFacts
     UnixOwner = 1 << 5,
     UnixGroup = 1 << 6,
 
-    Default = Type | Size | Modify | Perm | UnixMode | UnixOwner | UnixGroup,
+    /// <summary>
+    /// What a session emits until the client narrows or widens the set with OPTS MLST.
+    /// </summary>
+    /// <remarks>
+    /// UNIX.owner and UNIX.group are supported but off by default: they are the expensive facts
+    /// (an account lookup per owner) and many clients never send OPTS MLST, so they would pay for
+    /// facts they do not parse.
+    /// </remarks>
+    Default = Type | Size | Modify | Perm | UnixMode,
 }

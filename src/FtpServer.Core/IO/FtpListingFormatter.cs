@@ -87,12 +87,16 @@ public sealed class FtpListingFormatter(PermissionProvider permissionProvider)
             target.Append("modify=").Append(FormatTimestamp(item.LastWriteTime)).Append(';');
         }
 
-        var needsPermissions = (facts & (MlsxFacts.Perm | MlsxFacts.UnixMode | MlsxFacts.UnixOwner | MlsxFacts.UnixGroup)) != 0;
-        var permissions = needsPermissions ? GetPermissions(fileSystem, item) : default;
+        // On Windows the perm fact comes from the entry's attributes, which the enumeration already
+        // read, so only the UNIX.* facts pay for the ACL. On Unix the mode is one stat either way.
+        var unixFacts = (facts & (MlsxFacts.UnixMode | MlsxFacts.UnixOwner | MlsxFacts.UnixGroup)) != 0;
+        var needsPermissions = unixFacts || (facts.HasFlag(MlsxFacts.Perm) && !OperatingSystem.IsWindows());
+        var includeNames = (facts & (MlsxFacts.UnixOwner | MlsxFacts.UnixGroup)) != 0;
+        var permissions = needsPermissions ? GetPermissions(fileSystem, item, includeNames) : default;
 
         if (facts.HasFlag(MlsxFacts.Perm))
         {
-            target.Append("perm=").Append(GetPerm(item, canWrite, permissions)).Append(';');
+            target.Append("perm=").Append(GetPerm(item, canWrite, OperatingSystem.IsWindows() ? default : permissions)).Append(';');
         }
 
         if ((facts & (MlsxFacts.UnixMode | MlsxFacts.UnixOwner | MlsxFacts.UnixGroup)) != 0)
@@ -133,18 +137,29 @@ public sealed class FtpListingFormatter(PermissionProvider permissionProvider)
     /// </summary>
     /// <remarks>
     /// The fact advertises what the client may do, so the session and the object have to agree:
-    /// advertising an operation that then fails is worse than not advertising it. The object's
-    /// rights are its owner's, the closest the permission providers get without trying it.
+    /// advertising an operation that then fails is worse than not advertising it. On Unix the
+    /// object's rights are its owner's mode bits. On Windows they come from the read-only
+    /// attribute: the owner's ACL entry says nothing about the account the server runs as, and
+    /// reading it cost more than the rest of the listing together.
     /// </remarks>
     private static string GetPerm(FileSystemItem item, bool canWrite, FilePermissionResult permissions)
     {
-        // Zio exposes entries with no real path, and a host may refuse to report an ACL. Nothing
-        // is known about those, so the session's own rights are the only guide.
-        var unknown = permissions is { OwnerName: null, User: { Read: false, Write: false, Execute: false } };
+        bool readable, writable, traversable;
 
-        var readable = unknown || permissions.User.Read;
-        var writable = canWrite && (unknown || permissions.User.Write);
-        var traversable = unknown || permissions.User.Execute;
+        if (permissions.IsKnown)
+        {
+            readable = permissions.User.Read;
+            writable = canWrite && permissions.User.Write;
+            traversable = permissions.User.Execute;
+        }
+        else
+        {
+            // Windows, or an entry Zio exposes with no real path: the session's own rights, less
+            // what the read-only attribute forbids. Windows ignores that attribute on directories.
+            readable = true;
+            traversable = true;
+            writable = canWrite && (item.IsDirectory || (item.Attributes & FileAttributes.ReadOnly) == 0);
+        }
 
         var perm = new StringBuilder(8);
 
@@ -199,12 +214,12 @@ public sealed class FtpListingFormatter(PermissionProvider permissionProvider)
         }
     }
 
-    private FilePermissionResult GetPermissions(IFileSystem fileSystem, FileSystemItem item)
+    private FilePermissionResult GetPermissions(IFileSystem fileSystem, FileSystemItem item, bool includeNames = true)
     {
         try
         {
             var internalPath = fileSystem.ConvertPathToInternal(item.Path);
-            return permissionProvider.GetFilePermissions(item, internalPath);
+            return permissionProvider.GetFilePermissions(item, internalPath, includeNames);
         }
         catch
         {

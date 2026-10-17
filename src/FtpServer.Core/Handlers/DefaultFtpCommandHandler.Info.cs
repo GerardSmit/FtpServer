@@ -529,8 +529,12 @@ public partial class DefaultFtpCommandHandler
 
         if (OperatingSystem.IsWindows())
         {
-            // Windows has no Unix mode bits; refusing is honest, silently succeeding is not.
-            return session.WriteAsync("504 CHMOD is not supported on this platform.\r\n"u8, token);
+            // Windows has no Unix mode bits. The default is a 200 that says the mode was ignored,
+            // because clients that copy permissions on upload otherwise fail every transfer; an
+            // operator who prefers the strict answer gets the 504.
+            return options.Current.Features.IgnoreUnsupportedChmod
+                ? session.WriteAsync("200 SITE CHMOD ignored: this platform has no Unix permissions.\r\n"u8, token)
+                : session.WriteAsync("504 CHMOD is not supported on this platform.\r\n"u8, token);
         }
 
         try

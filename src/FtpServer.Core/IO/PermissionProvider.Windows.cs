@@ -12,7 +12,7 @@ public partial class PermissionProvider
     private static readonly SecurityIdentifier Everyone = new(WellKnownSidType.WorldSid, null);
 
     [SupportedOSPlatform("windows")]
-    private FilePermissionResult GetFilePermissionsWindows(in FileSystemItem item, string path)
+    private FilePermissionResult GetFilePermissionsWindows(in FileSystemItem item, string path, bool includeNames)
     {
         // One fetch covering all three sections: the previous code issued three separate
         // GetAccessControl calls per entry, which dominated the cost of a large listing.
@@ -20,8 +20,8 @@ public partial class PermissionProvider
             ? new DirectoryInfo(path).GetAccessControl(AccessControlSections.Access | AccessControlSections.Owner | AccessControlSections.Group)
             : new FileInfo(path).GetAccessControl(AccessControlSections.Access | AccessControlSections.Owner | AccessControlSections.Group);
 
-        var owner = TryGetIdentity(security, isOwner: true);
-        var group = TryGetIdentity(security, isOwner: false);
+        var owner = TryGetIdentity(security, isOwner: true, includeNames);
+        var group = TryGetIdentity(security, isOwner: false, includeNames);
 
         var rules = security.GetAccessRules(includeExplicit: true, includeInherited: true, typeof(SecurityIdentifier));
 
@@ -34,7 +34,7 @@ public partial class PermissionProvider
     }
 
     [SupportedOSPlatform("windows")]
-    private static (SecurityIdentifier? Sid, string? Name) TryGetIdentity(FileSystemSecurity security, bool isOwner)
+    private (SecurityIdentifier? Sid, string? Name) TryGetIdentity(FileSystemSecurity security, bool isOwner, bool includeNames)
     {
         try
         {
@@ -47,24 +47,46 @@ public partial class PermissionProvider
                 return (null, null);
             }
 
-            string? name;
-
-            try
-            {
-                name = ((NTAccount)sid.Translate(typeof(NTAccount))).Value;
-            }
-            catch (IdentityNotMappedException)
-            {
-                // Orphaned SID (deleted account, or a domain we cannot reach).
-                name = sid.Value;
-            }
-
-            return (sid, name);
+            return (sid, includeNames ? GetAccountName(sid) : null);
         }
         catch (Exception e) when (e is InvalidOperationException or UnauthorizedAccessException)
         {
             return (null, null);
         }
+    }
+
+    /// <summary>
+    /// Translates a SID to its account name, remembering the answer.
+    /// </summary>
+    /// <remarks>
+    /// A translation is an LSA lookup - and a round trip to a domain controller for a domain
+    /// account - costing far more than reading the ACL itself. A directory's entries almost always
+    /// share a handful of owners, so without the cache a listing paid that lookup twice per entry.
+    /// </remarks>
+    [SupportedOSPlatform("windows")]
+    private string GetAccountName(SecurityIdentifier sid)
+    {
+        var key = sid.Value;
+
+        if (_accountNames.TryGetValue(key, out var cached))
+        {
+            return cached;
+        }
+
+        string name;
+
+        try
+        {
+            name = ((NTAccount)sid.Translate(typeof(NTAccount))).Value;
+        }
+        catch (IdentityNotMappedException)
+        {
+            // Orphaned SID (deleted account, or a domain we cannot reach).
+            name = key;
+        }
+
+        CacheName(_accountNames, key, name);
+        return name;
     }
 
     /// <summary>

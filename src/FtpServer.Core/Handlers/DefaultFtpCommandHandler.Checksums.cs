@@ -90,9 +90,10 @@ public partial class DefaultFtpCommandHandler
 
         // HASH takes a pathname and nothing else; only the de-facto X* commands carry a range in
         // their argument, so the trailing-number heuristic must not be applied to HASH or a file
-        // whose name ends in a number becomes unreachable.
+        // whose name ends in a number becomes unreachable. For the X* commands an existing file
+        // named by the whole argument still wins over the heuristic.
         var parsed = legacy
-            ? data.TryGetChecksumRequest(session.CurrentDirectory, session.Encoding, out var request)
+            ? data.TryGetChecksumRequest(session.CurrentDirectory, session.Encoding, out var request, session.FileSystem.FileExists)
             : TryGetPathOnly(data, session, out request);
 
         if (!parsed)
@@ -145,8 +146,10 @@ public partial class DefaultFtpCommandHandler
 
         if (legacy)
         {
-            // The de-facto X* commands emit upper-case hex, unlike HASH.
-            await session.WriteAsync("213 "u8, digest.ToUpperInvariant(), "\r\n"u8, token);
+            // The de-facto X* commands answer 250 with the bare upper-case hex digest and nothing
+            // after it. Indy's TIdFTP (Beyond Compare among others) accepts no other code and
+            // reads the rest of the line as the digest, so 213 fails every comparison.
+            await session.WriteAsync("250 "u8,digest.ToUpperInvariant(), "\r\n"u8, token);
             return;
         }
 

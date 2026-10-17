@@ -187,6 +187,197 @@ public class ContainmentTests
     }
 
     [Fact]
+    public void A_link_is_still_refused_while_its_directory_is_being_enumerated()
+    {
+        // During an enumeration only the last component of a child is checked, since the
+        // directory itself was resolved when the enumeration began. A child that is itself a
+        // link must still be resolved in full - and refused when it leads out.
+        var outside = Path.Combine(Path.GetTempPath(), "ftpescape-" + Guid.NewGuid().ToString("N")[..8]);
+        var root = Path.Combine(Path.GetTempPath(), "ftproot-" + Guid.NewGuid().ToString("N")[..8]);
+
+        Directory.CreateDirectory(outside);
+        Directory.CreateDirectory(Path.Combine(root, "plain"));
+        File.WriteAllText(Path.Combine(root, "file.txt"), "x");
+
+        try
+        {
+            if (!TryCreateDirectoryLink(Path.Combine(root, "link"), outside))
+            {
+                return;
+            }
+
+            using var physical = new NoFollowPhysicalFileSystem(root);
+            using var fileSystem = new Zio.FileSystems.SubFileSystem(physical, physical.ConvertPathFromInternal(root), owned: false);
+
+            var seen = new List<string>();
+
+            foreach (var item in fileSystem.EnumerateItems(Zio.UPath.Root, SearchOption.TopDirectoryOnly))
+            {
+                var name = item.GetName();
+                seen.Add(name);
+
+                if (name == "link")
+                {
+                    Assert.Throws<UnauthorizedAccessException>(() => fileSystem.ConvertPathToInternal(item.Path));
+                }
+                else
+                {
+                    Assert.Equal(Path.Combine(root, name), fileSystem.ConvertPathToInternal(item.Path), ignoreCase: true);
+                }
+
+                // A path below the link is not a child of the enumerated directory.
+                Assert.Throws<UnauthorizedAccessException>(() => fileSystem.ConvertPathToInternal("/link/inner.txt"));
+            }
+
+            Assert.Equal(["file.txt", "link", "plain"], seen.Order());
+
+            // And nothing of the shortcut outlives the enumeration.
+            Assert.Throws<UnauthorizedAccessException>(() => fileSystem.ConvertPathToInternal("/link"));
+        }
+        finally
+        {
+            RemoveLink(Path.Combine(root, "link"));
+
+            try
+            {
+                Directory.Delete(root, recursive: true);
+                Directory.Delete(outside, recursive: true);
+            }
+            catch (IOException)
+            {
+                // Left for the OS to clean up.
+            }
+        }
+    }
+
+    /// <summary>Scratch directories for the tests that drive the file system directly.</summary>
+    private sealed class Scratch : IDisposable
+    {
+        private readonly List<string> _links = [];
+        private readonly List<string> _directories = [];
+
+        public string Directory(string prefix)
+        {
+            var path = Path.Combine(Path.GetTempPath(), prefix + "-" + Guid.NewGuid().ToString("N")[..8]);
+            System.IO.Directory.CreateDirectory(path);
+            _directories.Add(path);
+            return path;
+        }
+
+        public bool Link(string linkPath, string targetPath)
+        {
+            _links.Add(linkPath);
+            return TryCreateDirectoryLink(linkPath, targetPath);
+        }
+
+        public void Dispose()
+        {
+            // Links first, so a recursive delete never walks through one into its target.
+            foreach (var link in _links)
+            {
+                RemoveLink(link);
+            }
+
+            foreach (var directory in _directories)
+            {
+                try
+                {
+                    System.IO.Directory.Delete(directory, recursive: true);
+                }
+                catch (IOException)
+                {
+                    // Left for the OS to clean up.
+                }
+            }
+        }
+    }
+
+    private static Zio.FileSystems.SubFileSystem Jail(NoFollowPhysicalFileSystem physical, string root) =>
+        new(physical, physical.ConvertPathFromInternal(root), owned: true);
+
+    [Fact]
+    public void A_root_reached_through_a_link_still_confines_what_is_below_it()
+    {
+        // Only the components below the root are walked per operation, starting from where the
+        // root lands - so a root that is itself a link must still map onto its target correctly.
+        using var scratch = new Scratch();
+        var real = scratch.Directory("ftpreal");
+        var outside = scratch.Directory("ftpescape");
+        var parent = scratch.Directory("ftplinks");
+        File.WriteAllText(Path.Combine(real, "file.txt"), "x");
+
+        var root = Path.Combine(parent, "root");
+
+        if (!scratch.Link(root, real) || !scratch.Link(Path.Combine(real, "out"), outside))
+        {
+            return;
+        }
+
+        using var fileSystem = Jail(new NoFollowPhysicalFileSystem(root), root);
+
+        Assert.True(fileSystem.FileExists("/file.txt"));
+        Assert.Equal(Path.Combine(root, "file.txt"), fileSystem.ConvertPathToInternal("/file.txt"), ignoreCase: true);
+        Assert.Throws<UnauthorizedAccessException>(() => fileSystem.ConvertPathToInternal("/out"));
+        Assert.Throws<UnauthorizedAccessException>(() => fileSystem.ConvertPathToInternal("/out/secret.txt"));
+    }
+
+    [Fact]
+    public void A_link_chain_is_judged_by_where_it_finally_lands()
+    {
+        // "out" leaves the tree and "back" returns into it. The walk restarts at each target, and
+        // a target back inside the root restarts from the root rather than the volume.
+        using var scratch = new Scratch();
+        var root = scratch.Directory("ftproot");
+        var outside = scratch.Directory("ftpescape");
+        System.IO.Directory.CreateDirectory(Path.Combine(root, "sub"));
+        System.IO.Directory.CreateDirectory(Path.Combine(outside, "stays"));
+
+        if (!scratch.Link(Path.Combine(root, "out"), outside) ||
+            !scratch.Link(Path.Combine(outside, "back"), Path.Combine(root, "sub")))
+        {
+            return;
+        }
+
+        using var fileSystem = Jail(new NoFollowPhysicalFileSystem(root), root);
+
+        Assert.Equal(Path.Combine(root, "out", "back", "f.txt"), fileSystem.ConvertPathToInternal("/out/back/f.txt"), ignoreCase: true);
+        Assert.Throws<UnauthorizedAccessException>(() => fileSystem.ConvertPathToInternal("/out/stays/f.txt"));
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(200)]
+    public async Task A_root_swapped_for_a_link_is_refused_once_it_is_rechecked(int recheckMilliseconds)
+    {
+        // The root's own resolution is trusted for a short while instead of being walked on every
+        // operation. Once it is re-resolved, a root that now lands elsewhere refuses everything.
+        using var scratch = new Scratch();
+        var parent = scratch.Directory("ftpswap");
+        var outside = scratch.Directory("ftpescape");
+        var root = Path.Combine(parent, "root");
+        System.IO.Directory.CreateDirectory(root);
+        File.WriteAllText(Path.Combine(root, "file.txt"), "inside");
+        File.WriteAllText(Path.Combine(outside, "file.txt"), "outside");
+
+        using var fileSystem = Jail(new NoFollowPhysicalFileSystem(root, TimeSpan.FromMilliseconds(recheckMilliseconds)), root);
+
+        Assert.True(fileSystem.FileExists("/file.txt"));
+
+        // Swap the root for a junction to a directory outside it.
+        System.IO.Directory.Move(root, Path.Combine(parent, "moved"));
+
+        if (!scratch.Link(root, outside))
+        {
+            return;
+        }
+
+        await Task.Delay(recheckMilliseconds * 2);
+
+        Assert.Throws<UnauthorizedAccessException>(() => fileSystem.ConvertPathToInternal("/file.txt"));
+        Assert.Throws<UnauthorizedAccessException>(() => fileSystem.ConvertPathToInternal("/"));
+    }
+
+    [Fact]
     public void A_path_with_no_links_resolves_to_itself()
     {
         var root = Path.Combine(Path.GetTempPath(), "ftproot-" + Guid.NewGuid().ToString("N")[..8]);

@@ -141,13 +141,11 @@ public partial class DefaultFtpCommandHandler
             return session.WriteAsync("501 Syntax error in parameters or arguments.\r\n"u8, token);
         }
 
-        if (session.TransferType == FtpTransferType.Ascii && offset != 0)
-        {
-            // RFC 3659 section 5: a restart marker is only meaningful for a binary stream. This
-            // is a permanent refusal of the parameter, not a transient local error.
-            return session.WriteAsync("504 Restart not supported in ASCII mode.\r\n"u8, token);
-        }
-
+        // Accepted whatever the current TYPE: RFC 3659 section 5 defines REST for stream mode, and
+        // the type that matters is the one in force at RETR/STOR, which may still change. Refusing
+        // here also broke resume detection in clients that probe with "REST 1" right after login,
+        // while the session is still in the default TYPE A (Indy's TIdFTP, Beyond Compare).
+        // A nonzero marker that is still in TYPE A at transfer time is refused there with 554.
         session.RestartOffset = offset;
         return session.WriteAsync("350 Restarting at "u8, offset.ToString(), ". Send STORE or RETRIEVE.\r\n"u8, token);
     }
@@ -318,6 +316,13 @@ public partial class DefaultFtpCommandHandler
 
         try
         {
+            // Checked before the 150, so a refused marker is never the illegal "150 then 554".
+            if (offset > 0 && !TryValidateRestart(session, path, direction, offset, out var refusal))
+            {
+                await session.WriteAsync(refusal, token);
+                return;
+            }
+
             if (sendOpeningReply)
             {
                 if (openingReply is null)
@@ -364,6 +369,46 @@ public partial class DefaultFtpCommandHandler
         {
             session.TransferCancellation = null;
         }
+    }
+
+    /// <summary>
+    /// Decides whether a restart marker can be honoured by the transfer it precedes.
+    /// </summary>
+    /// <remarks>
+    /// In TYPE A the marker would count octets of the translated stream, which do not map onto
+    /// file offsets without reading the file up to that point; a resume only makes sense in
+    /// TYPE I. RFC 959 reserves 554 for exactly this: "invalid REST parameter".
+    /// </remarks>
+    private static bool TryValidateRestart(FtpSession session, UPath path, TransferDirection direction, long offset, out string refusal)
+    {
+        refusal = string.Empty;
+
+        if (session.TransferType == FtpTransferType.Ascii)
+        {
+            refusal = "554 Requested action not taken: restart is only supported in TYPE I.\r\n";
+            return false;
+        }
+
+        long length;
+
+        try
+        {
+            // A file that does not exist yet has nothing to resume, so any marker is past its end.
+            length = session.FileSystem.FileExists(path) ? session.FileSystem.GetFileLength(path) : 0;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // Let the transfer itself report what is wrong with the file.
+            return true;
+        }
+
+        if (offset > length)
+        {
+            refusal = "554 Requested action not taken: restart offset is past the end of the file.\r\n";
+            return false;
+        }
+
+        return true;
     }
 
     private static async ValueTask DownloadAsync(FtpSession session, UPath path, Stream destination, long offset, TimeSpan inactivity, CancellationToken token)
@@ -493,16 +538,30 @@ public partial class DefaultFtpCommandHandler
             destination.Seek(offset, SeekOrigin.Begin);
         }
 
-        if (session.TransferType == FtpTransferType.Ascii)
+        try
         {
-            await AsciiTransfer.FromNetworkAsync(source, destination, inactivity, token);
-        }
-        else
-        {
-            await CopyAsync(source, destination, inactivity, token);
-        }
+            if (session.TransferType == FtpTransferType.Ascii)
+            {
+                await AsciiTransfer.FromNetworkAsync(source, destination, inactivity, token);
+            }
+            else
+            {
+                await CopyAsync(source, destination, inactivity, token);
+            }
 
-        await destination.FlushAsync(token);
+            await destination.FlushAsync(token);
+        }
+        finally
+        {
+            // OpenOrCreate keeps whatever followed the marker, so a resumed upload shorter than
+            // the old file would leave stale bytes after its end. Cut at what was written, also
+            // when the transfer is interrupted: the next SIZE then reports the valid prefix, which
+            // is what the client resumes from.
+            if (offset > 0)
+            {
+                destination.SetLength(destination.Position);
+            }
+        }
     }
 
     // ---- metadata ---------------------------------------------------------

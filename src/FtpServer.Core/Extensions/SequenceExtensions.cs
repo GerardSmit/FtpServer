@@ -1,4 +1,4 @@
-using System.Buffers;
+﻿using System.Buffers;
 using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
 using System.Net;
@@ -515,7 +515,11 @@ public static class SequenceExtensions
     /// Parses the checksum-command argument: <c>&lt;pathname&gt;[ &lt;start&gt; &lt;end&gt;]</c>, also
     /// accepting the comma-separated form used by GlobalSCAPE and Serv-U.
     /// </summary>
-    public static bool TryGetChecksumRequest(this ReadOnlySequence<byte> sequence, UPath root, Encoding encoding, out ChecksumRequest request)
+    /// <param name="isFile">
+    /// Reports whether a path names an existing file. When the whole argument does, it is taken as
+    /// the pathname before any range is looked for, so "a,b.txt" and "report 2023" stay reachable.
+    /// </param>
+    public static bool TryGetChecksumRequest(this ReadOnlySequence<byte> sequence, UPath root, Encoding encoding, out ChecksumRequest request, Func<UPath, bool>? isFile = null)
     {
         request = default;
 
@@ -524,6 +528,14 @@ public static class SequenceExtensions
         if (text.Length == 0)
         {
             return false;
+        }
+
+        // The range syntax is ambiguous with names that contain a comma or end in a number. An
+        // existing file is the only reading that can be checked, so it wins.
+        if (isFile is not null && TryResolvePath(text, root, out var whole) && isFile(whole))
+        {
+            request = new ChecksumRequest(whole, null, null);
+            return true;
         }
 
         string pathPart;

@@ -484,8 +484,9 @@ public class ProtocolIntegrationTests
         var expectedSha256 = Convert.ToHexString(SHA256.HashData("hello world"u8.ToArray()));
         var expectedMd5 = Convert.ToHexString(MD5.HashData("hello world"u8.ToArray()));
 
-        Assert.Equal($"213 {expectedSha256}\r\n", await client.SendAsync("XSHA256 hash.txt"));
-        Assert.Equal($"213 {expectedMd5}\r\n", await client.SendAsync("XMD5 hash.txt"));
+        // The X* commands answer 250 with the bare digest; HASH keeps 213.
+        Assert.Equal($"250 {expectedSha256}\r\n", await client.SendAsync("XSHA256 hash.txt"));
+        Assert.Equal($"250 {expectedMd5}\r\n", await client.SendAsync("XMD5 hash.txt"));
 
         // draft-bryan-ftp-range uses an inclusive end offset, so 11 octets report as 0-10, and
         // the hash draft asks for a lowercase digest.
@@ -506,7 +507,7 @@ public class ProtocolIntegrationTests
         var part = await client.SendAsync("XSHA256 range.txt,0,5");
 
         Assert.NotEqual(whole, part);
-        Assert.Equal($"213 {Convert.ToHexString(SHA256.HashData("hello"u8.ToArray()))}\r\n", part);
+        Assert.Equal($"250 {Convert.ToHexString(SHA256.HashData("hello"u8.ToArray()))}\r\n", part);
     }
 
     [Fact]

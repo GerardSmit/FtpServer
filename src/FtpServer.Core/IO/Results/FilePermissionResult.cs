@@ -12,4 +12,7 @@ public readonly struct FilePermissionResult(
     public PermissionResult Other { get; } = other;
     public string? OwnerName { get; } = ownerName;
     public string? GroupName { get; } = groupName;
+
+    /// <summary>False for <c>default</c>: nothing could be read about the entry.</summary>
+    public bool IsKnown { get; } = true;
 }
