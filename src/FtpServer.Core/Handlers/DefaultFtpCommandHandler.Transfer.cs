@@ -438,25 +438,26 @@ public partial class DefaultFtpCommandHandler
     }
 
     /// <summary>
-    /// Copies with a per-read deadline, so a peer that stops sending is abandoned rather than
-    /// holding the session open forever.
+    /// Copies with an inactivity deadline on every read and write, so a peer that stops sending or
+    /// reading is abandoned rather than holding the session open forever.
     /// </summary>
     internal static async ValueTask CopyAsync(Stream source, Stream destination, TimeSpan inactivity, CancellationToken token)
     {
         var buffer = ArrayPool<byte>.Shared.Rent(TransferBufferSize);
+        using var deadline = new TransferDeadline(inactivity, token);
 
         try
         {
             while (true)
             {
-                var read = await ReadWithDeadlineAsync(source, buffer, inactivity, token);
+                var read = await deadline.ReadAsync(source, buffer);
 
                 if (read == 0)
                 {
                     return;
                 }
 
-                await WriteWithDeadlineAsync(destination, buffer.AsMemory(0, read), inactivity, token);
+                await deadline.WriteAsync(destination, buffer.AsMemory(0, read));
             }
         }
         finally
@@ -465,33 +466,15 @@ public partial class DefaultFtpCommandHandler
         }
     }
 
-    internal static async ValueTask<int> ReadWithDeadlineAsync(Stream source, byte[] buffer, TimeSpan inactivity, CancellationToken token)
-    {
-        if (inactivity <= TimeSpan.Zero)
-        {
-            return await source.ReadAsync(buffer, token);
-        }
-
-        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(token);
-        deadline.CancelAfter(inactivity);
-
-        try
-        {
-            return await source.ReadAsync(buffer, deadline.Token);
-        }
-        catch (OperationCanceledException) when (!token.IsCancellationRequested)
-        {
-            throw new FtpDataConnectionException("426 Transfer stalled; closing the data connection.");
-        }
-    }
-
     /// <summary>
-    /// Writes with the same deadline as a read.
+    /// A single write bounded by the inactivity deadline, for callers that write once rather than
+    /// stream; a transfer uses <see cref="TransferDeadline"/>.
     /// </summary>
     /// <remarks>
-    /// Bounding only reads leaves a download unbounded: the source is a local file that never
-    /// stalls, while the peer that has stopped reading blocks the write once its receive window
-    /// closes. That is the direction a slow-read denial of service uses.
+    /// Writes need a deadline as much as reads do. Bounding only reads leaves a download
+    /// unbounded: the source is a local file that never stalls, while the peer that has stopped
+    /// reading blocks the write once its receive window closes. That is the direction a
+    /// slow-read denial of service uses.
     /// </remarks>
     internal static async ValueTask WriteWithDeadlineAsync(Stream destination, ReadOnlyMemory<byte> buffer, TimeSpan inactivity, CancellationToken token)
     {
@@ -720,13 +703,14 @@ internal static class AsciiTransfer
 
         // Worst case is an all-LF or all-CR chunk, where every byte becomes two.
         var write = ArrayPool<byte>.Shared.Rent((BufferSize * 2) + 1);
+        using var deadline = new TransferDeadline(inactivity, token);
 
         try
         {
             var pendingCr = false;
             int count;
 
-            while ((count = await DefaultFtpCommandHandler.ReadWithDeadlineAsync(source, read, inactivity, token)) > 0)
+            while ((count = await deadline.ReadAsync(source, read)) > 0)
             {
                 var written = 0;
 
@@ -763,13 +747,13 @@ internal static class AsciiTransfer
                     write[written++] = b;
                 }
 
-                await DefaultFtpCommandHandler.WriteWithDeadlineAsync(destination, write.AsMemory(0, written), inactivity, token);
+                await deadline.WriteAsync(destination, write.AsMemory(0, written));
             }
 
             if (pendingCr)
             {
                 // The file ended on a CR, which still may not travel bare.
-                await DefaultFtpCommandHandler.WriteWithDeadlineAsync(destination, new byte[] { 0 }, inactivity, token);
+                await deadline.WriteAsync(destination, new byte[] { 0 });
             }
         }
         finally
@@ -831,13 +815,14 @@ internal static class AsciiTransfer
         // Two bytes of headroom: a CR held over from the previous chunk, and the CRLF that writes
         // two bytes for the one byte that triggered it.
         var write = ArrayPool<byte>.Shared.Rent(BufferSize + 2);
+        using var deadline = new TransferDeadline(inactivity, token);
 
         try
         {
             var pendingCr = false;
             int count;
 
-            while ((count = await DefaultFtpCommandHandler.ReadWithDeadlineAsync(source, read, inactivity, token)) > 0)
+            while ((count = await deadline.ReadAsync(source, read)) > 0)
             {
                 var written = 0;
 
@@ -896,4 +881,73 @@ internal static class AsciiTransfer
             ArrayPool<byte>.Shared.Return(write);
         }
     }
+}
+
+/// <summary>
+/// The inactivity deadline of one transfer: every read and write must make progress within it.
+/// </summary>
+/// <remarks>
+/// One timer re-armed per operation, where a linked token source per chunk would allocate a
+/// source and a timer for every 80 KB moved.
+/// </remarks>
+internal sealed class TransferDeadline : IDisposable
+{
+    private readonly CancellationTokenSource? _deadline;
+    private readonly TimeSpan _inactivity;
+    private readonly CancellationToken _token;
+
+    public TransferDeadline(TimeSpan inactivity, CancellationToken token)
+    {
+        _inactivity = inactivity;
+        _token = token;
+
+        if (inactivity > TimeSpan.Zero)
+        {
+            _deadline = CancellationTokenSource.CreateLinkedTokenSource(token);
+        }
+    }
+
+    public async ValueTask<int> ReadAsync(Stream source, Memory<byte> buffer)
+    {
+        if (_deadline is null)
+        {
+            return await source.ReadAsync(buffer, _token);
+        }
+
+        _deadline.CancelAfter(_inactivity);
+
+        try
+        {
+            return await source.ReadAsync(buffer, _deadline.Token);
+        }
+        catch (OperationCanceledException) when (!_token.IsCancellationRequested)
+        {
+            throw Stalled();
+        }
+    }
+
+    public async ValueTask WriteAsync(Stream destination, ReadOnlyMemory<byte> buffer)
+    {
+        if (_deadline is null)
+        {
+            await destination.WriteAsync(buffer, _token);
+            return;
+        }
+
+        _deadline.CancelAfter(_inactivity);
+
+        try
+        {
+            await destination.WriteAsync(buffer, _deadline.Token);
+        }
+        catch (OperationCanceledException) when (!_token.IsCancellationRequested)
+        {
+            throw Stalled();
+        }
+    }
+
+    private static FtpDataConnectionException Stalled() =>
+        new("426 Transfer stalled; closing the data connection.");
+
+    public void Dispose() => _deadline?.Dispose();
 }

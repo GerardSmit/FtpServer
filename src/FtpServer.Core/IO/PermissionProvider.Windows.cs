@@ -1,3 +1,5 @@
+using System.Collections.Concurrent;
+using System.Runtime.InteropServices;
 using System.Runtime.Versioning;
 using System.Security.AccessControl;
 using System.Security.Principal;
@@ -11,15 +13,61 @@ public partial class PermissionProvider
     [SupportedOSPlatform("windows")]
     private static readonly SecurityIdentifier Everyone = new(WellKnownSidType.WorldSid, null);
 
+    /// <summary>
+    /// Evaluated permissions by raw security descriptor, one map per <c>includeNames</c> setting.
+    /// Inherited ACEs are stored in every file's own descriptor, so the entries of one directory
+    /// nearly always share the same bytes, and parsing them into managed rule objects for each
+    /// entry is what made a listing slow.
+    /// </summary>
+    [SupportedOSPlatform("windows")]
+    private static readonly ConcurrentDictionary<byte[], FilePermissionResult> EvaluatedWithNames = new(ByteArrayComparer.Instance);
+
+    [SupportedOSPlatform("windows")]
+    private static readonly ConcurrentDictionary<byte[], FilePermissionResult> EvaluatedWithoutNames = new(ByteArrayComparer.Instance);
+
+    /// <summary>Bounds each evaluated map; cleared wholesale rather than tracking recency.</summary>
+    private const int EvaluatedCapacity = 1024;
+
+    private const AccessControlSections RequestedSections =
+        AccessControlSections.Access | AccessControlSections.Owner | AccessControlSections.Group;
+
     [SupportedOSPlatform("windows")]
     private FilePermissionResult GetFilePermissionsWindows(in FileSystemItem item, string path, bool includeNames)
     {
-        // One fetch covering all three sections: the previous code issued three separate
-        // GetAccessControl calls per entry, which dominated the cost of a large listing.
-        FileSystemSecurity security = item.IsDirectory
-            ? new DirectoryInfo(path).GetAccessControl(AccessControlSections.Access | AccessControlSections.Owner | AccessControlSections.Group)
-            : new FileInfo(path).GetAccessControl(AccessControlSections.Access | AccessControlSections.Owner | AccessControlSections.Group);
+        if (TryGetSecurityDescriptor(path) is not { } descriptor)
+        {
+            // The native read failed (an unusual path form, say); the managed one reports why.
+            return Evaluate(
+                item.IsDirectory
+                    ? new DirectoryInfo(path).GetAccessControl(RequestedSections)
+                    : new FileInfo(path).GetAccessControl(RequestedSections),
+                includeNames);
+        }
 
+        var evaluated = includeNames ? EvaluatedWithNames : EvaluatedWithoutNames;
+
+        if (evaluated.TryGetValue(descriptor, out var cached))
+        {
+            return cached;
+        }
+
+        var security = new FileSecurity();
+        security.SetSecurityDescriptorBinaryForm(descriptor, RequestedSections);
+
+        var result = Evaluate(security, includeNames);
+
+        if (evaluated.Count >= EvaluatedCapacity)
+        {
+            evaluated.Clear();
+        }
+
+        evaluated[descriptor] = result;
+        return result;
+    }
+
+    [SupportedOSPlatform("windows")]
+    private FilePermissionResult Evaluate(FileSystemSecurity security, bool includeNames)
+    {
         var owner = TryGetIdentity(security, isOwner: true, includeNames);
         var group = TryGetIdentity(security, isOwner: false, includeNames);
 
@@ -31,6 +79,65 @@ public partial class PermissionProvider
             Evaluate(rules, Everyone),
             owner.Name,
             group.Name);
+    }
+
+    /// <summary>
+    /// Reads the owner, group and DACL of <paramref name="path"/> as one self-relative security
+    /// descriptor, or returns null when the native call fails.
+    /// </summary>
+    [SupportedOSPlatform("windows")]
+    private static unsafe byte[]? TryGetSecurityDescriptor(string path)
+    {
+        const int SeFileObject = 1;
+        const int OwnerGroupDacl = 0x1 | 0x2 | 0x4;
+
+        var error = GetNamedSecurityInfo(path, SeFileObject, OwnerGroupDacl, null, null, null, null, out var descriptor);
+
+        if (error != 0 || descriptor == IntPtr.Zero)
+        {
+            return null;
+        }
+
+        try
+        {
+            var length = GetSecurityDescriptorLength(descriptor);
+            return new ReadOnlySpan<byte>((void*)descriptor, (int)length).ToArray();
+        }
+        finally
+        {
+            LocalFree(descriptor);
+        }
+    }
+
+    [LibraryImport("advapi32.dll", EntryPoint = "GetNamedSecurityInfoW", StringMarshalling = StringMarshalling.Utf16)]
+    private static unsafe partial uint GetNamedSecurityInfo(
+        string objectName,
+        int objectType,
+        int securityInfo,
+        void* owner,
+        void* group,
+        void* dacl,
+        void* sacl,
+        out IntPtr securityDescriptor);
+
+    [LibraryImport("advapi32.dll")]
+    private static partial uint GetSecurityDescriptorLength(IntPtr securityDescriptor);
+
+    [LibraryImport("kernel32.dll")]
+    private static partial IntPtr LocalFree(IntPtr memory);
+
+    private sealed class ByteArrayComparer : IEqualityComparer<byte[]>
+    {
+        public static readonly ByteArrayComparer Instance = new();
+
+        public bool Equals(byte[]? x, byte[]? y) => x.AsSpan().SequenceEqual(y);
+
+        public int GetHashCode(byte[] obj)
+        {
+            var hash = new HashCode();
+            hash.AddBytes(obj);
+            return hash.ToHashCode();
+        }
     }
 
     [SupportedOSPlatform("windows")]

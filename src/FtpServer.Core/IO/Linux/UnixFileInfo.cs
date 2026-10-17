@@ -4,7 +4,29 @@ namespace FtpServer.IO;
 
 public static partial class UnixFileInfo
 {
+    /// <summary>
+    /// getpwuid and getgrgid return a pointer into a static buffer that the next call overwrites,
+    /// so concurrent sessions must not interleave between the call and the copy.
+    /// </summary>
+    private static readonly Lock LookupGate = new();
+
     public static string GetUserName(uint uid)
+    {
+        lock (LookupGate)
+        {
+            return LookUpUserName(uid);
+        }
+    }
+
+    public static string GetGroupName(uint gid)
+    {
+        lock (LookupGate)
+        {
+            return LookUpGroupName(gid);
+        }
+    }
+
+    private static string LookUpUserName(uint uid)
     {
         var pwd = getpwuid(uid);
         if (pwd == IntPtr.Zero)
@@ -16,7 +38,7 @@ public static partial class UnixFileInfo
         return passwd.pw_name;
     }
 
-    public static string GetGroupName(uint gid)
+    private static string LookUpGroupName(uint gid)
     {
         var grp = getgrgid(gid);
         if (grp == IntPtr.Zero)
