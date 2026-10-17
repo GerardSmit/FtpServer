@@ -20,6 +20,8 @@ public sealed class FtpServerFixture : IAsyncDisposable
 
     public int Port { get; }
 
+    public IServiceProvider Services => _host.Services;
+
     private FtpServerFixture(IHost host, string root, int port)
     {
         _host = host;
@@ -386,8 +388,12 @@ public sealed class FtpTestClient(int port, bool implicitTls = false) : IAsyncDi
             TargetHost = targetHost,
         });
 
+        RemoteCertificate = ssl.RemoteCertificate;
         _stream = ssl;
     }
+
+    /// <summary>The certificate the server presented in the last handshake.</summary>
+    public System.Security.Cryptography.X509Certificates.X509Certificate? RemoteCertificate { get; private set; }
 
     /// <summary>
     /// Returns to reading and writing in the clear, as the server does after REIN.

@@ -2,6 +2,7 @@
 using System.IO.Hashing;
 using System.Security.Cryptography;
 using FtpServer.Extensions;
+using FtpServer.IO;
 using Zio;
 
 namespace FtpServer.Handlers;
@@ -136,7 +137,11 @@ public partial class DefaultFtpCommandHandler
 
         try
         {
-            digest = await ComputeAsync(session, request.Path, algorithm, start, end, token);
+            // A remote tree digests the file where it is, rather than streaming it here first.
+            digest = session.FileSystem is IFtpRemoteFileSystem remote &&
+                     await remote.ComputeChecksumAsync(request.Path, algorithm, start, end, token) is { } remoteDigest
+                ? remoteDigest.ToLowerInvariant()
+                : await ComputeAsync(session, request.Path, algorithm, start, end, token);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
@@ -250,6 +255,11 @@ public partial class DefaultFtpCommandHandler
             return session.WriteAsync("550 Directory not found.\r\n"u8, token);
         }
 
+        if (session.FileSystem is IFtpRemoteFileSystem remote)
+        {
+            return GetRemoteAvailableSpaceAsync(session, remote, path, token);
+        }
+
         try
         {
             var internalPath = session.FileSystem.ConvertPathToInternal(path);
@@ -260,6 +270,28 @@ public partial class DefaultFtpCommandHandler
         {
             return session.WriteAsync("550 Requested action not taken.\r\n"u8, token);
         }
+    }
+
+    private static async ValueTask GetRemoteAvailableSpaceAsync(FtpSession session, IFtpRemoteFileSystem remote, UPath path, CancellationToken token)
+    {
+        long? available;
+
+        try
+        {
+            available = await remote.GetAvailableSpaceAsync(path, token);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            available = null;
+        }
+
+        if (available is not { } bytes)
+        {
+            await session.WriteAsync("550 Requested action not taken.\r\n"u8, token);
+            return;
+        }
+
+        await session.WriteAsync("213 "u8, bytes.ToString(System.Globalization.CultureInfo.InvariantCulture), "\r\n"u8, token);
     }
 
     public override ValueTask GetDirectorySizeAsync(FtpSession session, ReadOnlySequence<byte> data, CancellationToken token)

@@ -95,4 +95,7 @@ public static partial class Log
 
     [LoggerMessage(EventId = 507, Level = LogLevel.Error, Message = "Settings file {Path} could not be read and was ignored; the server keeps running with the previous configuration")]
     public static partial void SettingsFileUnreadable(ILogger logger, string path, Exception ex);
+
+    [LoggerMessage(EventId = 508, Level = LogLevel.Information, Message = "Serving TLS certificate {Subject} ({Thumbprint}) to new connections")]
+    public static partial void UsingCertificate(ILogger logger, string subject, string thumbprint);
 }

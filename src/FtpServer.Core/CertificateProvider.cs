@@ -17,6 +17,7 @@ public sealed class CertificateProvider(
     private X509Certificate2? _certificate;
     private X509Certificate2Collection? _intermediates;
     private SslStreamCertificateContext? _certificateContext;
+    private readonly List<X509Certificate2> _replaced = [];
     private bool _disposed;
 
     /// <summary>
@@ -84,6 +85,65 @@ public sealed class CertificateProvider(
                 _intermediates,
                 offline: true);
         }
+    }
+
+    /// <summary>
+    /// Serves <paramref name="certificates"/> from now on, in place of the configured or
+    /// previously used certificate.
+    /// </summary>
+    /// <remarks>
+    /// For a certificate that is renewed while the server runs. Handshakes already under way, and
+    /// the sessions they belong to, keep the certificate they started with: the replaced ones are
+    /// only disposed with the provider. The collection is taken over, and is the leaf with a
+    /// private key plus the chain that issued it, as in a PFX.
+    /// </remarks>
+    public void Use(X509Certificate2Collection certificates)
+    {
+        ArgumentNullException.ThrowIfNull(certificates);
+
+        var leaf = SelectLeaf(certificates);
+
+        if (!leaf.HasPrivateKey)
+        {
+            throw new InvalidOperationException(
+                $"The TLS certificate '{leaf.Subject}' has no private key, so it cannot be used to serve FTPS.");
+        }
+
+        var intermediates = new X509Certificate2Collection();
+
+        foreach (var candidate in certificates)
+        {
+            if (!ReferenceEquals(candidate, leaf))
+            {
+                intermediates.Add(candidate);
+            }
+        }
+
+        var context = SslStreamCertificateContext.Create(
+            leaf,
+            intermediates.Count > 0 ? intermediates : null,
+            offline: true);
+
+        lock (_gate)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+
+            if (_certificate is { } previous)
+            {
+                _replaced.Add(previous);
+            }
+
+            if (_intermediates is { } previousIntermediates)
+            {
+                _replaced.AddRange(previousIntermediates);
+            }
+
+            _certificate = leaf;
+            _intermediates = intermediates.Count > 0 ? intermediates : null;
+            _certificateContext = context;
+        }
+
+        Log.UsingCertificate(logger, leaf.Subject, leaf.Thumbprint);
     }
 
     public SslServerAuthenticationOptions CreateServerAuthenticationOptions() => new()
@@ -247,6 +307,13 @@ public sealed class CertificateProvider(
 
                 _intermediates = null;
             }
+
+            foreach (var certificate in _replaced)
+            {
+                certificate.Dispose();
+            }
+
+            _replaced.Clear();
         }
     }
 }

@@ -2,6 +2,7 @@
 using System.Net;
 using System.Net.Sockets;
 using FtpServer.Extensions;
+using FtpServer.IO;
 using Zio;
 
 namespace FtpServer.Handlers;
@@ -590,7 +591,8 @@ public partial class DefaultFtpCommandHandler
             return session.WriteAsync("550 File not found.\r\n"u8, token);
         }
 
-        if (OperatingSystem.IsWindows())
+        // A remote tree has no host path to chmod, which is the same as having no mode bits.
+        if (OperatingSystem.IsWindows() || session.FileSystem is IFtpRemoteFileSystem)
         {
             // Windows has no Unix mode bits. The default is a 200 that says the mode was ignored,
             // because clients that copy permissions on upload otherwise fail every transfer; an
@@ -798,6 +800,13 @@ public partial class DefaultFtpCommandHandler
         }
 
         var fileSystem = session.FileSystem;
+
+        // A link is made on the host, and a remote tree has no host path to make it at.
+        if (fileSystem is IFtpRemoteFileSystem)
+        {
+            return session.WriteAsync("550 Requested action not taken: links cannot be created here.\r\n"u8, token);
+        }
+
         var targetIsDirectory = fileSystem.DirectoryExists(target);
 
         if (!targetIsDirectory && !fileSystem.FileExists(target))

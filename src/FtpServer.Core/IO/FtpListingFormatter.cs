@@ -216,6 +216,13 @@ public sealed class FtpListingFormatter(PermissionProvider permissionProvider)
 
     private FilePermissionResult GetPermissions(IFileSystem fileSystem, FileSystemItem item, bool includeNames = true)
     {
+        // No host path to read an ACL or mode from: the attributes the enumeration returned are
+        // all there is, and asking for the path would throw once per entry.
+        if (fileSystem is IFtpRemoteFileSystem)
+        {
+            return GetRemotePermissions(item);
+        }
+
         try
         {
             var internalPath = fileSystem.ConvertPathToInternal(item.Path);
@@ -226,6 +233,23 @@ public sealed class FtpListingFormatter(PermissionProvider permissionProvider)
             // Zio exposes virtual entries (for example /mnt on Windows) that have no real path.
             return default;
         }
+    }
+
+    /// <summary>
+    /// What a remote entry allows: everything for the owner, less writing where the read-only
+    /// attribute forbids it, and reading for everyone else.
+    /// </summary>
+    private static FilePermissionResult GetRemotePermissions(FileSystemItem item)
+    {
+        var writable = item.IsDirectory || (item.Attributes & FileAttributes.ReadOnly) == 0;
+        var others = new PermissionResult(read: true, write: false, execute: item.IsDirectory);
+
+        return new FilePermissionResult(
+            new PermissionResult(read: true, write: writable, execute: item.IsDirectory),
+            others,
+            others,
+            "ftp",
+            "ftp");
     }
 
     private static void AppendTriplet(StringBuilder target, PermissionResult permission)

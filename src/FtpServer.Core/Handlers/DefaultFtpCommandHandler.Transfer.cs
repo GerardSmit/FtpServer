@@ -967,7 +967,8 @@ public partial class DefaultFtpCommandHandler
                 session.FileSystem.SetCreationTime(path, c.UtcDateTime);
             }
 
-            if (mode is { } unixMode && !OperatingSystem.IsWindows())
+            // A remote tree has no host path to set the mode on; the mode is left as it is, as on Windows.
+            if (mode is { } unixMode && !OperatingSystem.IsWindows() && session.FileSystem is not IFtpRemoteFileSystem)
             {
                 File.SetUnixFileMode(session.FileSystem.ConvertPathToInternal(path), (UnixFileMode)unixMode);
             }
