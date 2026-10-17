@@ -4,6 +4,8 @@
         <TargetFramework>net10.0</TargetFramework>
         <RootNamespace>FtpServer</RootNamespace>
         <IsAotCompatible>true</IsAotCompatible>
+        <IsPackable>true</IsPackable>
+        <Description>Raw-socket hosting for FtpServer.Core, as an IHostedService.</Description>
     </PropertyGroup>
 
     <ItemGroup>

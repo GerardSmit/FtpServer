@@ -1,0 +1,308 @@
+name: Publish
+
+# Releases FtpServer.Core, FtpServer.Sockets and FtpServer.Kestrel to nuget.org.
+#
+# Run it from the Actions tab ("Run workflow") and pick the bump: the version is the latest v* tag
+# bumped by that much, the tag is created once the packages are published, and a GitHub release
+# follows. Pushing a v1.2.3 tag by hand releases exactly that version instead.
+#
+# The file name matters: the nuget.org trusted publishing policy names publish.yml, and only a run
+# of this file can exchange its OIDC token for a NuGet API key.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Version bump type"
+        required: true
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+        default: patch
+
+# One release at a time: two concurrent runs would compute the same next version.
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+env:
+  CI: 'true'
+  DOTNET_NOLOGO: 'true'
+
+jobs:
+  build-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Restore
+        run: dotnet restore
+
+      - name: Build
+        run: dotnet build --no-restore --configuration Release
+
+      - name: Test
+        run: dotnet test --no-build --configuration Release
+
+  release_artifacts:
+    needs: build-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      previous_version: ${{ steps.version.outputs.previous_version }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Every tag, to find the latest release and the commits since it.
+          fetch-depth: 0
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Determine version
+        id: version
+        env:
+          BUMP: ${{ github.event.inputs.bump }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" && "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "::error::Releases are cut from main, not $GITHUB_REF_NAME."
+            exit 1
+          fi
+
+          tags=$(git tag -l 'v*' --sort=-v:refname)
+
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            version="${GITHUB_REF_NAME#v}"
+            previous_tag=$(grep -vxF "$GITHUB_REF_NAME" <<< "$tags" | head -n 1 || true)
+          else
+            previous_tag=$(head -n 1 <<< "$tags")
+
+            if [[ -n "$previous_tag" ]]; then
+              base="${previous_tag#v}"
+            else
+              base=$(sed -n -E 's#.*<VersionPrefix>([^<]*)</VersionPrefix>.*#\1#p' Directory.Build.props | head -n 1)
+            fi
+
+            # A prerelease suffix on the base is dropped: the bump releases the next stable version.
+            IFS=. read -r major minor patch <<< "${base%%-*}"
+
+            case "$BUMP" in
+              major) version="$((major + 1)).0.0" ;;
+              minor) version="$major.$((minor + 1)).0" ;;
+              *)     version="$major.$minor.$((patch + 1))" ;;
+            esac
+
+            if git rev-parse -q --verify "refs/tags/v$version" > /dev/null; then
+              echo "::error::Tag v$version already exists."
+              exit 1
+            fi
+          fi
+
+          {
+            echo "version=$version"
+            echo "tag=v$version"
+            echo "previous_version=${previous_tag#v}"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Releasing $version (previous: ${previous_tag:-none})"
+
+      - name: Restore
+        run: dotnet restore
+
+      - name: Build
+        run: dotnet build --no-restore --configuration Release -p:Version=${{ steps.version.outputs.version }}
+
+      - name: Pack
+        run: dotnet pack --no-build --configuration Release -p:Version=${{ steps.version.outputs.version }} --output artifacts
+
+      - name: Check the packages
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          for id in FtpServer.Core FtpServer.Sockets FtpServer.Kestrel; do
+            for ext in nupkg snupkg; do
+              test -f "artifacts/$id.$VERSION.$ext" || { echo "::error::Missing $id.$VERSION.$ext"; exit 1; }
+            done
+          done
+
+      # Consumes the packages exactly as a user would, from the files about to be published, so a
+      # broken dependency graph or a missing assembly fails here rather than on nuget.org.
+      - name: Smoke test the packages
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          smoke="$RUNNER_TEMP/smoke"
+          mkdir -p "$smoke"
+          cd "$smoke"
+
+          dotnet new console --framework net10.0 --output . --name Smoke
+          cat > nuget.config <<EOF
+          <?xml version="1.0" encoding="utf-8"?>
+          <configuration>
+            <packageSources>
+              <add key="local" value="$GITHUB_WORKSPACE/artifacts" />
+            </packageSources>
+          </configuration>
+          EOF
+
+          dotnet add package FtpServer.Sockets --version "$VERSION"
+          dotnet add package FtpServer.Kestrel --version "$VERSION"
+
+          cat > Program.cs <<'EOF'
+          // Touches a type from each package, so a missing assembly is a compile error.
+          Console.WriteLine(typeof(FtpServer.FtpSession).Assembly.GetName().Name);
+          Console.WriteLine(typeof(FtpServer.Services.FtpListener).Assembly.GetName().Name);
+          EOF
+
+          dotnet build --configuration Release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ steps.version.outputs.version }}
+          path: artifacts/
+          if-no-files-found: error
+
+  publish_release:
+    needs: release_artifacts
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      # Tag and GitHub release.
+      contents: write
+      # NuGet trusted publishing exchanges this run's OIDC token for a short-lived API key.
+      id-token: write
+    outputs:
+      version: ${{ needs.release_artifacts.outputs.version }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Download the tested packages
+        uses: actions/download-artifact@v4
+        with:
+          name: release-${{ needs.release_artifacts.outputs.version }}
+          path: artifacts
+
+      - name: Log in to NuGet
+        id: login
+        uses: NuGet/login@v1
+        with:
+          # The nuget.org profile name (not the e-mail address) that owns the trusted publishing policy.
+          user: ${{ secrets.NUGET_USER }}
+
+      # The .snupkg symbol packages next to them are pushed along with each .nupkg.
+      - name: Publish to NuGet
+        run: >
+          dotnet nuget push "artifacts/*.nupkg"
+          --api-key "${{ steps.login.outputs.NUGET_API_KEY }}"
+          --source https://api.nuget.org/v3/index.json
+          --skip-duplicate
+
+      # A tag pushed with the workflow token does not start another run, so this cannot publish twice.
+      - name: Create tag
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          TAG: ${{ needs.release_artifacts.outputs.tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "Release $TAG"
+          git push origin "$TAG"
+
+      - name: Generate release notes
+        env:
+          VERSION: ${{ needs.release_artifacts.outputs.version }}
+          PREVIOUS_VERSION: ${{ needs.release_artifacts.outputs.previous_version }}
+        run: |
+          set -euo pipefail
+
+          if [[ -n "$PREVIOUS_VERSION" ]]; then
+            git log --pretty=format:"- %s (%h)" --no-merges "v$PREVIOUS_VERSION..HEAD" > release_notes.md
+          else
+            git log --pretty=format:"- %s (%h)" --no-merges > release_notes.md
+          fi
+
+          {
+            echo
+            echo
+            echo "**NuGet:**"
+            for id in FtpServer.Core FtpServer.Sockets FtpServer.Kestrel; do
+              echo "- [$id $VERSION](https://www.nuget.org/packages/$id/$VERSION)"
+            done
+          } >> release_notes.md
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.release_artifacts.outputs.tag }}
+          name: FtpServer v${{ needs.release_artifacts.outputs.version }}
+          body_path: release_notes.md
+          files: artifacts/*.nupkg
+          generate_release_notes: false
+          prerelease: ${{ contains(needs.release_artifacts.outputs.version, '-') }}
+
+  # Records the released version as the VersionPrefix on main, so a local build reports the
+  # version it is built on top of. Release builds override it, so it is not load-bearing.
+  #
+  # Deliberately a separate job: it pushes a commit, and doing that inside publish_release would
+  # risk changing the tree that was just packed and published.
+  sync-version:
+    needs: publish_release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Sync VersionPrefix on the default branch
+        env:
+          VERSION: ${{ needs.publish_release.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          # sed rather than an XML rewrite: one line changes, the rest stays byte-for-byte.
+          sed -i -E "s#<VersionPrefix>[^<]*</VersionPrefix>#<VersionPrefix>$VERSION</VersionPrefix>#" Directory.Build.props
+
+          if git diff --quiet; then
+            echo "Already at $VERSION; nothing to do."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Directory.Build.props
+          # [skip ci]: otherwise the bot's own commit starts another CI run.
+          git commit -m "Set version to $VERSION [skip ci]"
+          git push

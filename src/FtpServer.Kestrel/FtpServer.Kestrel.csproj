@@ -3,6 +3,8 @@
     <PropertyGroup>
         <TargetFramework>net10.0</TargetFramework>
         <RootNamespace>FtpServer</RootNamespace>
+        <IsPackable>true</IsPackable>
+        <Description>Kestrel hosting for FtpServer.Core: serve FTP from an ASP.NET Core application.</Description>
     </PropertyGroup>
 
     <ItemGroup>

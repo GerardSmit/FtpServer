@@ -28,6 +28,7 @@ public partial class PermissionProvider
     /// <summary>Bounds each evaluated map; cleared wholesale rather than tracking recency.</summary>
     private const int EvaluatedCapacity = 1024;
 
+    [SupportedOSPlatform("windows")]
     private const AccessControlSections RequestedSections =
         AccessControlSections.Access | AccessControlSections.Owner | AccessControlSections.Group;
 

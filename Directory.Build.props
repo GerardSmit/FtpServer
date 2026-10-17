@@ -25,6 +25,35 @@
 
     <PropertyGroup Condition="'$(CI)' == 'true'">
         <WarningsAsErrors>$(WarningsAsErrors);NU1901;NU1902;NU1903;NU1904</WarningsAsErrors>
+        <ContinuousIntegrationBuild>true</ContinuousIntegrationBuild>
     </PropertyGroup>
+
+    <!--
+      NuGet packages. Nothing is packed unless its project opts in with IsPackable; the libraries
+      do, the server executable, source generator and tests do not.
+
+      Releases are cut by .github/workflows/publish.yml, which passes the version explicitly and
+      afterwards records it here. VersionPrefix is only the starting point for the first release
+      (a "minor" bump of 0.0.0 releases 0.1.0) and what a local build reports.
+    -->
+    <PropertyGroup>
+        <IsPackable>false</IsPackable>
+        <VersionPrefix>0.0.0</VersionPrefix>
+        <Authors>Gerard Smit</Authors>
+        <Description>FTP(S) server library for .NET with NativeAOT support.</Description>
+        <PackageTags>ftp;ftps;ftp-server;server</PackageTags>
+        <PackageLicenseExpression>MIT</PackageLicenseExpression>
+        <PackageProjectUrl>https://github.com/GerardSmit/FtpServer</PackageProjectUrl>
+        <RepositoryUrl>https://github.com/GerardSmit/FtpServer</RepositoryUrl>
+        <RepositoryType>git</RepositoryType>
+        <PackageReadmeFile>README.md</PackageReadmeFile>
+        <IncludeSymbols>true</IncludeSymbols>
+        <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+    </PropertyGroup>
+
+    <!-- Items are evaluated after every property, so this sees the project's own IsPackable. -->
+    <ItemGroup Condition="'$(IsPackable)' == 'true'">
+        <None Include="$(MSBuildThisFileDirectory)README.md" Pack="true" PackagePath="\" Visible="false" />
+    </ItemGroup>
 
 </Project>
