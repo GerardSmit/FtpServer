@@ -23,8 +23,10 @@ FTP(S) server implementation in C# / .NET
 - Two hosting front-ends: raw sockets (default) and Kestrel
 
 **FTP**
-- FTPS (explicit `AUTH TLS`), with optional TLS on the data connection and session resumption
-  across the two (so clients that require it, such as FileZilla, are satisfied)
+- FTPS, explicit (`AUTH TLS`) and implicit (TLS from the first byte on a second port,
+  conventionally 990), with optional TLS on the data connection and session resumption across the
+  two (so clients that require it, such as FileZilla, are satisfied)
+- `MODE Z` deflate compression of the data connection
 - Active and passive mode, including IPv6 (`EPRT`/`EPSV`) and the long forms (`LPRT`/`LPSV`)
 - UTF-8 pathnames (RFC 2640)
 
@@ -35,14 +37,15 @@ FTP(S) server implementation in C# / .NET
 | Access control | `USER` `PASS` `ACCT` `REIN` `QUIT` `HOST` |
 | Security | `AUTH` `PBSZ` `PROT` |
 | Navigation | `CWD` `CDUP` `PWD` `MKD` `RMD` `RMDA` `DELE` `RNFR` `RNTO` `XCUP` `XMKD` `XPWD` `XRMD` |
-| Transfer setup | `TYPE` `MODE` `STRU` `ALLO` `REST` `PORT` `EPRT` `LPRT` `PASV` `EPSV` `LPSV` |
+| Transfer setup | `TYPE` `MODE` (`S`, `Z`) `STRU` `ALLO` `REST` `PORT` `EPRT` `LPRT` `PASV` `EPSV` `LPSV` |
 | Transfers | `RETR` `STOR` `STOU` `APPE` `ABOR` |
 | Listings | `LIST` (incl. `-R` unless `Features.LISTR` is off, and a pathname) `NLST` `MLSD` `MLST` `STAT` |
-| Metadata | `SIZE` `MDTM` `MFMT` `AVBL` `DSIZ` |
+| Metadata | `SIZE` `MDTM` `MFMT` `MFCT` (Windows, macOS) `MFF` `AVBL` `DSIZ` |
 | Checksums | `HASH` `RANG` `XCRC` `XMD5` `XSHA1` `XSHA256` `XSHA512` |
-| Informational | `FEAT` `OPTS` `HELP` `SYST` `NOOP` `SITE` (`CHMOD`/`HELP`/`UTIME`) `LANG` `CLNT` `CSID` |
+| Informational | `FEAT` `OPTS` `HELP` `SYST` `NOOP` `SITE` (`CHMOD`/`HELP`/`SYMLINK`/`UTIME`) `LANG` `CLNT` `CSID` |
 
-Deliberately answered `502`: `SMNT`, `SPSV`, `THMB`, `MFCT`, `MFF`, `XRCP`, `XRSQ`, `XSEM`, `XSEN`,
+Deliberately answered `502`: `SMNT`, `SPSV`, `THMB`, `XRCP`, `XRSQ`, `XSEM`, `XSEN`, `MFCT` on Linux
+(which has no way to set a creation time),
 and the RFC 2228 mechanisms that TLS does not use (`ADAT`, `MIC`, `CONF`, `ENC`). `CCC` answers
 `534` rather than dropping the control connection back to cleartext.
 
@@ -76,6 +79,25 @@ Where the RFCs leave room, the server answers the way common clients expect:
 - **`SITE CHMOD` on Windows answers `200` and changes nothing**, saying so in the reply text.
   Clients that copy permissions on upload (Beyond Compare does by default) would otherwise report
   every upload as failed. Set `Features.IgnoreUnsupportedChmod` to `false` for a `504` instead.
+- **`SITE UTIME` accepts all three forms clients send**: ProFTPD's time-first
+  `SITE UTIME <YYYYMMDDhhmm[ss]> <path>`, the multi-timestamp
+  `SITE UTIME <path> <atime> <mtime> <ctime> UTC` (Pure-FTPd, WinSCP), and `<path> <time>`.
+  Pathnames may contain spaces in every form.
+- **`MDTM <time> <path>` sets the modification time**, the form servers used before `MFMT`, with
+  Serv-U's optional `+/-minutes` zone suffix. A file whose name really begins with a timestamp is
+  still read, never written.
+- **`MFF` is all or nothing**: it sets `modify`, `create` (Windows, macOS) and `UNIX.mode` (Unix),
+  and a fact it cannot change refuses the whole command with `504`.
+- **`MODE Z`** compresses transfers and listings with zlib; `OPTS MODE Z LEVEL <0-9>` picks the
+  level (default 6). Clients only use it when `FEAT` lists it and their user enables compression.
+  `Features.ModeZ` turns it off.
+- **`SITE SYMLINK <target> <link>` is off by default** (`Features.SiteSymlink`). When on, the target
+  is resolved like any pathname, must exist inside the same folder tree as the link, and the link
+  stores a relative path, so it can never reach anything the session could not reach already. On
+  Windows it needs Developer Mode or the symbolic-link privilege.
+- **Implicit FTPS** (`ImplicitTlsPort`) protects the data connection by default, accepts `PROT`
+  without `PBSZ`, answers `AUTH` with `503`, and keeps TLS through `REIN`. It is independent of
+  `Ftps`, which governs explicit `AUTH TLS` on `Port`.
 
 ## Configuration
 
@@ -89,6 +111,7 @@ command line — later sources win.
   "Passive": true,
   "Ftps": false,
   "RequireTls": false,        // reject USER/PASS until AUTH TLS has run
+  "ImplicitTlsPort": null,    // e.g. 990: also serve implicit FTPS on this port
   "ReadOnly": false,
 
   "FollowLinks": false,       // follow junctions/symlinks that lead outside Path
@@ -141,8 +164,10 @@ command line — later sources win.
     "LISTR": true,               // honour LIST -R; off ignores the flag
     "MLST": true,
     "Hash": true,                // HASH
-    "Site": true,                // SITE CHMOD/HELP/UTIME
-    "IgnoreUnsupportedChmod": true  // Windows: SITE CHMOD answers 200 as a no-op, not 504
+    "Site": true,                // SITE CHMOD/HELP/UTIME (and SYMLINK, below)
+    "IgnoreUnsupportedChmod": true, // Windows: SITE CHMOD answers 200 as a no-op, not 504
+    "ModeZ": true,               // MODE Z deflate compression
+    "SiteSymlink": false         // SITE SYMLINK, confined to the session's own tree
   }
 }
 ```

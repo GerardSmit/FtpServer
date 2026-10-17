@@ -146,7 +146,7 @@ public sealed class FtpServerFixture : IAsyncDisposable
 /// Minimal raw-protocol client. Deliberately not a real FTP library, so a test can send exactly
 /// the bytes it wants - including malformed ones.
 /// </summary>
-public sealed class FtpTestClient(int port) : IAsyncDisposable
+public sealed class FtpTestClient(int port, bool implicitTls = false) : IAsyncDisposable
 {
     private readonly TcpClient _client = new();
     private Stream _stream = Stream.Null;
@@ -157,6 +157,13 @@ public sealed class FtpTestClient(int port) : IAsyncDisposable
     {
         await _client.ConnectAsync(IPAddress.Loopback, port);
         _stream = _client.GetStream();
+
+        // Implicit FTPS: the handshake comes first, and even the greeting arrives protected.
+        if (implicitTls)
+        {
+            await StartTlsAsync();
+        }
+
         Banner = await ReadReplyAsync("the greeting");
     }
 

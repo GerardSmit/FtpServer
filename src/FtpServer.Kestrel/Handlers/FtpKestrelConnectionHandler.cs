@@ -23,6 +23,9 @@ public class FtpKestrelConnectionHandler(
         session.RemoteEndPoint = connection.RemoteEndPoint;
         session.LocalEndPoint = connection.LocalEndPoint;
 
-        await connectionHandler.HandleConnection(session, connection.Transport, connection.ConnectionClosed);
+        await connectionHandler.HandleConnection(session, connection.Transport, connection.ConnectionClosed, ImplicitTls);
     }
+
+    /// <summary>Whether this endpoint is implicit FTPS (TLS before the greeting).</summary>
+    protected virtual bool ImplicitTls => false;
 }

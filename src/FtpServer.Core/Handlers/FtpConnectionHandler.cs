@@ -2,6 +2,7 @@
 using System.Diagnostics;
 using System.IO.Pipelines;
 using System.Net.Security;
+using System.Security.Authentication;
 using FtpServer.Data;
 using FtpServer.Extensions;
 using FtpServer.Options;
@@ -32,7 +33,11 @@ public partial class FtpConnectionHandler(
         FtpCommand.StoreFileUniquely or
         FtpCommand.Append;
 
-    public async Task HandleConnection(FtpSession session, IDuplexPipe pipe, CancellationToken token)
+    /// <param name="implicitTls">
+    /// True for the implicit FTPS port: the TLS handshake comes first, before the greeting, and
+    /// the session is protected from its very first reply.
+    /// </param>
+    public async Task HandleConnection(FtpSession session, IDuplexPipe pipe, CancellationToken token, bool implicitTls = false)
     {
         var connection = options.Current.Connection;
         var input = pipe.Input;
@@ -44,6 +49,28 @@ public partial class FtpConnectionHandler(
         Task? activeTransfer = null;
 
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(lifetime.ApplicationStopping, token);
+
+        if (implicitTls)
+        {
+            try
+            {
+                pipe = await AuthenticateAsServerAsync(session, pipe, cts.Token);
+            }
+            catch (Exception ex) when (ex is AuthenticationException or IOException or OperationCanceledException)
+            {
+                // Nothing has been said yet, so there is nobody to tell; the transport closes.
+                Log.ImplicitTlsHandshakeFailed(logger, session.RemoteEndPoint?.ToString(), ex);
+                return;
+            }
+
+            didSwitchProtocol = true;
+            input = pipe.Input;
+
+            session.Transport = pipe;
+            session.IsProtected = true;
+            session.IsImplicitTls = true;
+            session.ResetProtectionParameters();
+        }
 
         await session.WriteAsync("220 Service ready for new user.\r\n"u8, cts.Token);
 
@@ -559,7 +586,15 @@ public partial class FtpConnectionHandler(
     private async Task<IDuplexPipe> SwitchProtocolAsync(FtpSession session, IDuplexPipe pipe, CancellationToken token)
     {
         await session.WriteAsync("234 Proceed with authentication mechanism.\r\n"u8, token);
+        return await AuthenticateAsServerAsync(session, pipe, token);
+    }
 
+    /// <summary>
+    /// Runs the server side of the TLS handshake over <paramref name="pipe"/> and returns the
+    /// protected pipe: after AUTH TLS, or straight away on the implicit FTPS port.
+    /// </summary>
+    private async Task<IDuplexPipe> AuthenticateAsServerAsync(FtpSession session, IDuplexPipe pipe, CancellationToken token)
+    {
         var sslDuplex = new SslDuplexPipe(pipe, SslReaderOptions, SslWriterOptions);
 
         try

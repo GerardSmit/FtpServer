@@ -13,6 +13,9 @@ public static class SocketsExtensions
         services.AddHostedService<FtpHostedService>();
         services.TryAddSingleton<FtpListener, DefaultFtpListener>();
 
+        // A separate instance for the implicit FTPS port, used only when ImplicitTlsPort is set.
+        services.TryAddKeyedSingleton<FtpListener, DefaultFtpListener>(FtpHostedService.ImplicitTlsListenerKey);
+
         if (configure != null)
         {
             services.Configure(configure);

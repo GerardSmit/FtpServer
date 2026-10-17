@@ -83,7 +83,15 @@ public static class FtpOptionsValidator
 
         // FTPS with a certificate file that is not there would otherwise fail once per client
         // instead of once at startup.
-        if (options is { Ftps: true, Certificate.Path: { Length: > 0 } certificatePath } &&
+        if (options.ImplicitTlsPort is { } implicitPort &&
+            (implicitPort is < 1 or > 65535 || implicitPort == options.Port))
+        {
+            error = "ImplicitTlsPort must be between 1 and 65535 and differ from Port.";
+            return false;
+        }
+
+        if ((options.Ftps || options.ImplicitTlsPort is not null) &&
+            options.Certificate.Path is { Length: > 0 } certificatePath &&
             !File.Exists(certificatePath))
         {
             error = $"Certificate.Path '{certificatePath}' does not exist.";

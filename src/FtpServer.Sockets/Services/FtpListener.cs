@@ -16,6 +16,12 @@ public abstract class FtpListener(FtpSessionProvider sessionProvider, FtpConnect
     private readonly HashSet<Task> _clients = [];
 
     private CancellationTokenSource _shutdown = new();
+
+    /// <summary>
+    /// Whether connections to this listener are implicit FTPS: TLS from the first byte, before
+    /// the greeting. Set by <see cref="Listen"/>.
+    /// </summary>
+    protected bool ImplicitTls { get; private set; }
     private Task? _acceptLoop;
     private Socket? _listener;
 
@@ -29,12 +35,15 @@ public abstract class FtpListener(FtpSessionProvider sessionProvider, FtpConnect
         ProtocolType protocolType = ProtocolType.Tcp,
         int listenBacklog = 20,
         PipeOptions? sendOptions = null,
-        PipeOptions? receiveOptions = null)
+        PipeOptions? receiveOptions = null,
+        bool implicitTls = false)
     {
         if (_listener is not null)
         {
             throw new InvalidOperationException("Already listening");
         }
+
+        ImplicitTls = implicitTls;
 
         addressFamily ??= endPoint.AddressFamily;
 

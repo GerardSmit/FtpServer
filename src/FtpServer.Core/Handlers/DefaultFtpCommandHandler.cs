@@ -230,7 +230,9 @@ public partial class DefaultFtpCommandHandler(
         // teardown once this reply has been written.
         await session.WriteAsync("220 Service ready for new user.\r\n"u8, token);
 
-        session.ClearProtectionRequested = wasProtected;
+        // Except on the implicit port, where the connection never existed in the clear and a
+        // client expects TLS from the server's every byte.
+        session.ClearProtectionRequested = wasProtected && !session.IsImplicitTls;
     }
 
     public override ValueTask DisconnectAsync(FtpSession session, ReadOnlySequence<byte> data, CancellationToken token)
@@ -241,7 +243,13 @@ public partial class DefaultFtpCommandHandler(
 
     public override ValueTask AuthenticationSecurityMechanismAsync(FtpSession session, ReadOnlySequence<byte> data, CancellationToken token)
     {
-        // Reached only when FTPS is disabled; the connection handler performs the upgrade itself.
+        // Reached when the connection is already protected (after AUTH, or on the implicit port)
+        // or when explicit FTPS is disabled; the connection handler performs the upgrade itself.
+        if (session.IsProtected)
+        {
+            return session.WriteAsync("503 Bad sequence of commands: the connection is already protected.\r\n"u8, token);
+        }
+
         if (!options.Current.Ftps)
         {
             return session.WriteAsync("534 Request denied for policy reasons: TLS is not enabled.\r\n"u8, token);

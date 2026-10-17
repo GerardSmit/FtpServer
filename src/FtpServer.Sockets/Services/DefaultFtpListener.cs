@@ -15,7 +15,7 @@ public class DefaultFtpListener(
         Log.AcceptConnection(logger, session.RemoteEndPoint?.ToString());
 
         // Passing the listener's token means shutdown actually reaches an in-flight transfer.
-        await handler.HandleConnection(session, session.Transport, token);
+        await handler.HandleConnection(session, session.Transport, token, ImplicitTls);
     }
 
     protected override void OnStarted(EndPoint endPoint)

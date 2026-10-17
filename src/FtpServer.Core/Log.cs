@@ -37,6 +37,11 @@ public static partial class Log
     [LoggerMessage(EventId = 202, Level = LogLevel.Warning, Message = "Client pipelined data before the TLS handshake; closing the connection")]
     public static partial void PipelinedDataBeforeTlsUpgrade(ILogger logger);
 
+    // Debug: a port scanner or a plain-FTP client on the implicit port fails the handshake
+    // routinely, and logging that louder would let any peer fill the log.
+    [LoggerMessage(EventId = 205, Level = LogLevel.Debug, Message = "Implicit TLS handshake with {EndPoint} failed; closing the connection")]
+    public static partial void ImplicitTlsHandshakeFailed(ILogger logger, string? endPoint, Exception ex);
+
     // 3xx - data connections
     [LoggerMessage(EventId = 300, Level = LogLevel.Debug, Message = "Passive connection ({EndPoint}) accepted in {Elapsed:0.000} ms")]
     public static partial void PassiveConnectionAccepted(ILogger logger, IPAddress? endPoint, double elapsed);

@@ -69,7 +69,8 @@ public partial class DefaultFtpCommandHandler
 
             await using (var channel = await session.DataStreamProvider.CreateDataChannelAsync(session, cts.Token))
             {
-                await WriteListingAsync(session, channel.Stream, request, format, cts.Token);
+                await UseDataStreamAsync(session, channel.Stream, sending: true,
+                    stream => WriteListingAsync(session, stream, request, format, cts.Token));
             }
 
             await session.WriteAsync("226 Transfer complete.\r\n"u8, token);
@@ -427,7 +428,7 @@ public partial class DefaultFtpCommandHandler
             {
                 $"Connected to {Describe(session.RemoteEndPoint)}",
                 session.IsAuthenticated ? $"Logged in as {session.User?.Name}" : "Not logged in",
-                $"TYPE: {(session.TransferType == FtpTransferType.Ascii ? "ASCII" : "BINARY")}, STRUcture: File, transfer MODE: Stream",
+                $"TYPE: {(session.TransferType == FtpTransferType.Ascii ? "ASCII" : "BINARY")}, STRUcture: File, transfer MODE: {(session.TransferMode == FtpTransferMode.Deflate ? $"Z (level {session.DeflateLevel})" : "Stream")}",
                 session.IsProtected ? "TLS: control connection is protected" : "TLS: control connection is in the clear",
                 session.TransferCancellation is not null ? "Status: transfer in progress" : "Status: idle",
             };

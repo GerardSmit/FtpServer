@@ -21,6 +21,15 @@ public static class KestrelExtensions
             listenOptions.UseConnectionHandler<FtpKestrelConnectionHandler>();
         });
 
+        if (ftpOptions.ImplicitTlsPort is { } implicitPort)
+        {
+            options.ListenAnyIP(implicitPort, listenOptions =>
+            {
+                configure?.Invoke(listenOptions);
+                listenOptions.UseConnectionHandler<FtpKestrelImplicitTlsConnectionHandler>();
+            });
+        }
+
         return options;
     }
 

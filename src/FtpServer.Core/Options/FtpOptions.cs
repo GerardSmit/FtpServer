@@ -26,6 +26,13 @@ public class FtpOptions
     public bool Ftps { get; set; }
 
     /// <summary>
+    /// Also listen for implicit FTPS on this port (conventionally 990): TLS from the first byte,
+    /// before the greeting, with no AUTH command. Null leaves it off. Independent of
+    /// <see cref="Ftps"/>, which governs explicit AUTH TLS on <see cref="Port"/>.
+    /// </summary>
+    public int? ImplicitTlsPort { get; set; }
+
+    /// <summary>
     /// Require the client to issue AUTH TLS before USER/PASS.
     /// </summary>
     public bool RequireTls { get; set; }
@@ -292,6 +299,19 @@ public class FtpFeatureOptions
     /// The 200 says plainly that the mode was ignored.
     /// </remarks>
     public bool IgnoreUnsupportedChmod { get; set; } = true;
+
+    /// <summary>
+    /// Offer MODE Z: deflate compression of the data connection (draft-preston-ftpext-deflate),
+    /// which clients only use when FEAT lists it and their user asks for it.
+    /// </summary>
+    public bool ModeZ { get; set; } = true;
+
+    /// <summary>
+    /// Honour SITE SYMLINK. Off by default: a link is a lasting change to what the tree exposes.
+    /// Links are confined to the session's own tree either way - a target that resolves outside
+    /// it is refused - but an operator should still opt in to letting users create them.
+    /// </summary>
+    public bool SiteSymlink { get; set; }
 }
 
 public class PassivePortRangeOptions

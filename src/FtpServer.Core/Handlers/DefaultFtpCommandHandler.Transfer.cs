@@ -1,4 +1,5 @@
 ﻿using System.Buffers;
+using System.IO.Compression;
 using FtpServer.Data;
 using FtpServer.Extensions;
 using FtpServer.IO;
@@ -90,10 +91,23 @@ public partial class DefaultFtpCommandHandler
             return rejected;
         }
 
-        // RFC 959 minimum implementation: only stream mode is required, and it is all we support.
+        // RFC 959 requires only stream mode. Block and compressed modes are not implemented; the
+        // deflate extension (MODE Z) is, when enabled.
         if (data.EqualsIgnoreCase("S"u8))
         {
+            session.TransferMode = FtpTransferMode.Stream;
             return session.WriteAsync("200 Mode set to S.\r\n"u8, token);
+        }
+
+        if (data.EqualsIgnoreCase("Z"u8) && options.Current.Features.ModeZ)
+        {
+            session.TransferMode = FtpTransferMode.Deflate;
+            return session.WriteAsync("200 Mode set to Z.\r\n"u8, token);
+        }
+
+        if (data.EqualsIgnoreCase("Z"u8))
+        {
+            return session.WriteAsync("504 Command not implemented for that parameter.\r\n"u8, token);
         }
 
         return data.EqualsIgnoreCase("B"u8) || data.EqualsIgnoreCase("C"u8)
@@ -341,11 +355,13 @@ public partial class DefaultFtpCommandHandler
             {
                 if (direction == TransferDirection.Download)
                 {
-                    await DownloadAsync(session, path, channel.Stream, offset, inactivity, cts.Token);
+                    await UseDataStreamAsync(session, channel.Stream, sending: true,
+                        stream => DownloadAsync(session, path, stream, offset, inactivity, cts.Token));
                 }
                 else
                 {
-                    await UploadAsync(session, path, channel.Stream, mode, offset, inactivity, cts.Token);
+                    await UseDataStreamAsync(session, channel.Stream, sending: false,
+                        stream => UploadAsync(session, path, stream, mode, offset, inactivity, cts.Token));
                 }
             }
 
@@ -359,6 +375,12 @@ public partial class DefaultFtpCommandHandler
         catch (FtpDataConnectionException ex)
         {
             await session.WriteAsync(ex.Reply + "\r\n", token);
+        }
+        catch (InvalidDataException ex)
+        {
+            // MODE Z upload whose compressed stream does not decode.
+            Log.RequestException(logger, ex);
+            await session.WriteAsync("451 Requested action aborted: the compressed data is invalid.\r\n"u8, token);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
@@ -409,6 +431,44 @@ public partial class DefaultFtpCommandHandler
         }
 
         return true;
+    }
+
+    /// <summary>
+    /// Runs <paramref name="transfer"/> over the data connection, through zlib when MODE Z is in
+    /// effect: compressing what the server sends, decompressing what it receives.
+    /// </summary>
+    internal static async ValueTask UseDataStreamAsync(FtpSession session, Stream connection, bool sending, Func<Stream, ValueTask> transfer)
+    {
+        if (session.TransferMode != FtpTransferMode.Deflate)
+        {
+            await transfer(connection);
+            return;
+        }
+
+        var zlib = sending
+            ? new ZLibStream(connection, new ZLibCompressionOptions { CompressionLevel = session.DeflateLevel }, leaveOpen: true)
+            : new ZLibStream(connection, CompressionMode.Decompress, leaveOpen: true);
+
+        try
+        {
+            await transfer(zlib);
+
+            // Disposing writes the final deflate block, which is part of the transfer: it has to
+            // reach the client before the data connection closes.
+            await zlib.DisposeAsync();
+        }
+        finally
+        {
+            try
+            {
+                // A no-op after the dispose above. After a failure, the attempt to finish the
+                // stream may itself fail on the broken connection; that must not hide why.
+                zlib.Dispose();
+            }
+            catch (Exception ex) when (ex is IOException or ObjectDisposedException or OperationCanceledException)
+            {
+            }
+        }
     }
 
     private static async ValueTask DownloadAsync(FtpSession session, UPath path, Stream destination, long offset, TimeSpan inactivity, CancellationToken token)
@@ -604,11 +664,128 @@ public partial class DefaultFtpCommandHandler
         // RFC 3659 section 3 defines MDTM over retrievable objects, and shows 550 for a directory.
         if (!session.FileSystem.FileExists(path))
         {
-            return session.WriteAsync("550 File not found.\r\n"u8, token);
+            // Not a file by that name: perhaps the pre-MFMT "MDTM <time> <path>" that sets the time,
+            // which some clients still send. A file whose name really begins with a timestamp was
+            // matched above, so reading always wins over writing.
+            return TrySetModifyTimeLegacy(session, data, token, out var setReply)
+                ? setReply
+                : session.WriteAsync("550 File not found.\r\n"u8, token);
         }
 
         var timestamp = session.FileSystem.GetLastWriteTime(path);
         return session.WriteAsync("213 "u8, FtpListingFormatter.FormatTimestamp(timestamp), "\r\n"u8, token);
+    }
+
+    /// <summary>
+    /// Handles <c>MDTM YYYYMMDDHHMMSS[+-TZ] &lt;path&gt;</c>, the form servers used to set a
+    /// timestamp before MFMT existed. The optional suffix is the client's offset from UTC in
+    /// minutes (Serv-U); without it the time is UTC.
+    /// </summary>
+    /// <returns>False when the argument is not in that form, leaving the caller's 550 to stand.</returns>
+    private static bool TrySetModifyTimeLegacy(FtpSession session, ReadOnlySequence<byte> data, CancellationToken token, out ValueTask reply)
+    {
+        reply = ValueTask.CompletedTask;
+
+        var text = data.GetString(session.Encoding);
+        var space = text.IndexOf(' ');
+
+        if (space < 0 || !TryParseZonedTimeVal(text[..space], out var timestamp))
+        {
+            return false;
+        }
+
+        if (TryPrepareMetadataChange(session, text[(space + 1)..], out var path, out reply))
+        {
+            reply = SetTimesAsync(session, path, timestamp, creation: null, token);
+        }
+
+        return true;
+    }
+
+    /// <summary>A time-val optionally followed by the client's offset from UTC in minutes.</summary>
+    private static bool TryParseZonedTimeVal(string value, out DateTimeOffset timestamp)
+    {
+        timestamp = default;
+
+        // The sign can only follow the 14 digits, which also keeps it clear of a fraction.
+        var sign = value.Length > 14 ? value.IndexOfAny(['+', '-'], 14) : -1;
+
+        if (sign < 0)
+        {
+            return TryParseTimeVal(value, out timestamp);
+        }
+
+        if (!TryParseTimeVal(value[..sign], out var local) ||
+            !int.TryParse(value.AsSpan(sign + 1), System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var minutes) ||
+            minutes > 24 * 60)
+        {
+            return false;
+        }
+
+        // The digits are the client's local time; taking its offset away gives UTC.
+        timestamp = local - TimeSpan.FromMinutes(value[sign] == '-' ? -minutes : minutes);
+        return true;
+    }
+
+    /// <summary>
+    /// The checks shared by every command that changes an object's metadata: a writable session,
+    /// a valid path outside any read-only folder, and an object that exists.
+    /// </summary>
+    private static bool TryPrepareMetadataChange(FtpSession session, string pathText, out UPath path, out ValueTask reply)
+    {
+        path = default;
+
+        if (TryRejectReadOnly(session, out reply))
+        {
+            return false;
+        }
+
+        if (!Extensions.SequenceExtensions.TryResolvePath(pathText, session.CurrentDirectory, out path))
+        {
+            reply = session.WriteAsync("550 Invalid path.\r\n"u8);
+            return false;
+        }
+
+        if (TryRejectReadOnlyPath(session, path, out reply))
+        {
+            return false;
+        }
+
+        if (!session.FileSystem.FileExists(path) && !session.FileSystem.DirectoryExists(path))
+        {
+            reply = session.WriteAsync("550 File not found.\r\n"u8);
+            return false;
+        }
+
+        reply = ValueTask.CompletedTask;
+        return true;
+    }
+
+    /// <summary>Sets the time given and replies in the draft-somers-ftp-mfxx form.</summary>
+    private static ValueTask SetTimesAsync(FtpSession session, UPath path, DateTimeOffset? modify, DateTimeOffset? creation, CancellationToken token)
+    {
+        try
+        {
+            if (modify is { } m)
+            {
+                session.FileSystem.SetLastWriteTime(path, m.UtcDateTime);
+            }
+
+            if (creation is { } c)
+            {
+                session.FileSystem.SetCreationTime(path, c.UtcDateTime);
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or PlatformNotSupportedException)
+        {
+            return session.WriteAsync("550 Requested action not taken.\r\n"u8, token);
+        }
+
+        var fact = modify is { } modified
+            ? "Modify=" + FtpListingFormatter.FormatTimestamp(modified)
+            : "Create=" + FtpListingFormatter.FormatTimestamp(creation!.Value);
+
+        return session.WriteAsync("213 "u8, fact + "; " + path.FullName, "\r\n"u8, token);
     }
 
     public override ValueTask ModifyLastModificationTimeAsync(FtpSession session, ReadOnlySequence<byte> data, CancellationToken token)
@@ -618,12 +795,12 @@ public partial class DefaultFtpCommandHandler
             return rejected;
         }
 
-        if (TryRejectReadOnly(session, out var readOnly))
-        {
-            return readOnly;
-        }
+        return SetTimeCommandAsync(session, data, creation: false, token);
+    }
 
-        // MFMT <time-val> SP <pathname>
+    /// <summary>MFMT and MFCT: <c>&lt;time-val&gt; SP &lt;pathname&gt;</c> (draft-somers-ftp-mfxx).</summary>
+    private static ValueTask SetTimeCommandAsync(FtpSession session, ReadOnlySequence<byte> data, bool creation, CancellationToken token)
+    {
         var text = data.GetString(session.Encoding);
         var space = text.IndexOf(' ');
 
@@ -637,32 +814,24 @@ public partial class DefaultFtpCommandHandler
             return session.WriteAsync("501 Invalid time-val.\r\n"u8, token);
         }
 
-        if (!Extensions.SequenceExtensions.TryResolvePath(text[(space + 1)..], session.CurrentDirectory, out var path))
+        if (!TryPrepareMetadataChange(session, text[(space + 1)..], out var path, out var reply))
         {
-            return session.WriteAsync("550 Invalid path.\r\n"u8, token);
+            return reply;
         }
 
-        if (TryRejectReadOnlyPath(session, path, out readOnly))
-        {
-            return readOnly;
-        }
-
-        if (!session.FileSystem.FileExists(path) && !session.FileSystem.DirectoryExists(path))
-        {
-            return session.WriteAsync("550 File not found.\r\n"u8, token);
-        }
-
-        try
-        {
-            session.FileSystem.SetLastWriteTime(path, timestamp.UtcDateTime);
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-        {
-            return session.WriteAsync("550 Requested action not taken.\r\n"u8, token);
-        }
-
-        return session.WriteAsync("213 Modify="u8, FtpListingFormatter.FormatTimestamp(timestamp) + "; " + path.FullName, "\r\n"u8, token);
+        return creation
+            ? SetTimesAsync(session, path, modify: null, timestamp, token)
+            : SetTimesAsync(session, path, timestamp, creation: null, token);
     }
+
+    /// <summary>
+    /// Whether the host can set a creation time. Linux has no call that writes a birth time, so
+    /// MFCT and the MFF create fact are not offered there.
+    /// </summary>
+    internal static bool CanSetCreationTime => OperatingSystem.IsWindows() || OperatingSystem.IsMacOS();
+
+    /// <summary>Whether the MFF UNIX.mode fact can be applied: only where there are Unix mode bits.</summary>
+    internal static bool CanSetUnixMode => !OperatingSystem.IsWindows();
 
     private static bool TryParseTimeVal(string value, out DateTimeOffset timestamp)
     {
@@ -683,10 +852,137 @@ public partial class DefaultFtpCommandHandler
     }
 
     public override ValueTask ModifyCreationTimeAsync(FtpSession session, ReadOnlySequence<byte> data, CancellationToken token)
-        => session.WriteAsync("502 Command not implemented.\r\n"u8, token);
+    {
+        if (TryRejectAnonymous(session, FtpCommand.ModifyCreationTime, out var rejected))
+        {
+            return rejected;
+        }
 
+        if (!CanSetCreationTime)
+        {
+            return session.WriteAsync("502 Command not implemented: this platform cannot set a creation time.\r\n"u8, token);
+        }
+
+        return SetTimeCommandAsync(session, data, creation: true, token);
+    }
+
+    /// <summary>
+    /// MFF <c>&lt;fact&gt;=&lt;value&gt;;... SP &lt;pathname&gt;</c> (draft-somers-ftp-mfxx section 3.3).
+    /// </summary>
+    /// <remarks>
+    /// All or nothing: every fact is validated before any is applied, and one the server cannot
+    /// change refuses the whole command with 504. The reply echoes the facts that were set.
+    /// </remarks>
     public override ValueTask ModifyFactAsync(FtpSession session, ReadOnlySequence<byte> data, CancellationToken token)
-        => session.WriteAsync("502 Command not implemented.\r\n"u8, token);
+    {
+        if (TryRejectAnonymous(session, FtpCommand.ModifyFact, out var rejected))
+        {
+            return rejected;
+        }
+
+        var text = data.GetString(session.Encoding);
+        var space = text.IndexOf(' ');
+
+        if (space <= 0)
+        {
+            return session.WriteAsync("501 Syntax error in parameters or arguments.\r\n"u8, token);
+        }
+
+        DateTimeOffset? modify = null;
+        DateTimeOffset? create = null;
+        int? mode = null;
+        var applied = new List<string>();
+
+        foreach (var fact in text[..space].Split(';', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var equals = fact.IndexOf('=');
+
+            if (equals <= 0)
+            {
+                return session.WriteAsync("501 Syntax error in parameters or arguments.\r\n"u8, token);
+            }
+
+            var name = fact[..equals];
+            var value = fact[(equals + 1)..];
+
+            switch (name.ToLowerInvariant())
+            {
+                case "modify":
+                    if (!TryParseTimeVal(value, out var modified))
+                    {
+                        return session.WriteAsync("501 Invalid value for fact "u8, name, ".\r\n"u8, token);
+                    }
+
+                    modify = modified;
+                    applied.Add(name + "=" + FtpListingFormatter.FormatTimestamp(modified));
+                    break;
+
+                case "create" when CanSetCreationTime:
+                    if (!TryParseTimeVal(value, out var created))
+                    {
+                        return session.WriteAsync("501 Invalid value for fact "u8, name, ".\r\n"u8, token);
+                    }
+
+                    create = created;
+                    applied.Add(name + "=" + FtpListingFormatter.FormatTimestamp(created));
+                    break;
+
+                case "unix.mode" when CanSetUnixMode:
+                    // Up to four octal digits (setuid/setgid/sticky included), leading zeros allowed.
+                    var digits = value.TrimStart('0');
+
+                    if (value.Length > 5 || digits.Length > 4 || !TryParseOctal(digits.Length == 0 ? "0" : digits, out var bits))
+                    {
+                        return session.WriteAsync("501 Invalid value for fact "u8, name, ".\r\n"u8, token);
+                    }
+
+                    mode = bits;
+                    applied.Add(name + "=" + value);
+                    break;
+
+                default:
+                    return session.WriteAsync("504 Fact "u8, name, " cannot be modified.\r\n"u8, token);
+            }
+        }
+
+        if (applied.Count == 0)
+        {
+            return session.WriteAsync("501 Syntax error in parameters or arguments.\r\n"u8, token);
+        }
+
+        if (!TryPrepareMetadataChange(session, text[(space + 1)..], out var path, out var reply))
+        {
+            return reply;
+        }
+
+        try
+        {
+            if (modify is { } m)
+            {
+                session.FileSystem.SetLastWriteTime(path, m.UtcDateTime);
+            }
+
+            if (create is { } c)
+            {
+                session.FileSystem.SetCreationTime(path, c.UtcDateTime);
+            }
+
+            if (mode is { } unixMode && !OperatingSystem.IsWindows())
+            {
+                File.SetUnixFileMode(session.FileSystem.ConvertPathToInternal(path), (UnixFileMode)unixMode);
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or PlatformNotSupportedException)
+        {
+            return session.WriteAsync("550 Requested action not taken.\r\n"u8, token);
+        }
+
+        return session.WriteAsync("213 "u8, string.Join(';', applied) + "; " + path.FullName, "\r\n"u8, token);
+    }
+
+    /// <summary>The MFF facts this host can change, as FEAT lists them.</summary>
+    internal static string ModifiableFacts =>
+        "modify;" + (CanSetCreationTime ? "create;" : string.Empty) + (CanSetUnixMode ? "UNIX.mode;" : string.Empty);
 }
 
 /// <summary>

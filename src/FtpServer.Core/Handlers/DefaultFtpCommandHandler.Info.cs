@@ -2,6 +2,7 @@
 using System.Net;
 using System.Net.Sockets;
 using FtpServer.Extensions;
+using Zio;
 
 namespace FtpServer.Handlers;
 
@@ -26,10 +27,17 @@ public partial class DefaultFtpCommandHandler
         // RFC 2389 section 3.2: one feature per line, each preceded by a single space.
         var lines = new List<string> { "Features:" };
 
-        if (options.Current.Ftps)
+        if (options.Current.Ftps && !session.IsImplicitTls)
         {
             // RFC 4217 section 6 requires all three to be advertised.
             lines.Add(" AUTH TLS");
+            lines.Add(" PBSZ");
+            lines.Add(" PROT");
+        }
+        else if (session.IsImplicitTls)
+        {
+            // Already protected, so there is nothing for AUTH to do; the data channel is still
+            // negotiable.
             lines.Add(" PBSZ");
             lines.Add(" PROT");
         }
@@ -57,6 +65,19 @@ public partial class DefaultFtpCommandHandler
 
         lines.Add(" MDTM");
         lines.Add(" MFMT");
+
+        if (CanSetCreationTime)
+        {
+            lines.Add(" MFCT");
+        }
+
+        lines.Add(" MFF " + ModifiableFacts);
+
+        if (features.ModeZ)
+        {
+            lines.Add(" MODE Z");
+        }
+
         lines.Add(" REST STREAM");
         lines.Add(" SIZE");
         lines.Add(" TVFS");
@@ -88,7 +109,7 @@ public partial class DefaultFtpCommandHandler
 
         if (features.Site)
         {
-            lines.Add(" SITE CHMOD;HELP;UTIME");
+            lines.Add(" SITE " + string.Join(';', SiteCommands()));
         }
 
         return session.WriteMultilineAsync("211", lines, "End", token);
@@ -142,6 +163,30 @@ public partial class DefaultFtpCommandHandler
                     // an empty selection replies with no trailing space.
                     var selected = MlsxFactList(facts, marked: false);
                     return session.WriteAsync(selected.Length == 0 ? "200 MLST OPTS\r\n" : $"200 MLST OPTS {selected}\r\n", token);
+                }
+
+            case "MODE":
+                {
+                    // draft-preston-ftpext-deflate: "OPTS MODE Z LEVEL <n>", n from 0 to 9.
+                    var parts = argument.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+
+                    if (!options.Current.Features.ModeZ ||
+                        parts.Length == 0 ||
+                        !parts[0].Equals("Z", StringComparison.OrdinalIgnoreCase))
+                    {
+                        return session.WriteAsync("501 Option not understood.\r\n"u8, token);
+                    }
+
+                    if (parts.Length != 3 ||
+                        !parts[1].Equals("LEVEL", StringComparison.OrdinalIgnoreCase) ||
+                        !int.TryParse(parts[2], System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var level) ||
+                        level > 9)
+                    {
+                        return session.WriteAsync("501 Syntax error in parameters or arguments.\r\n"u8, token);
+                    }
+
+                    session.DeflateLevel = level;
+                    return session.WriteAsync($"200 MODE Z LEVEL set to {level}.\r\n", token);
                 }
 
             case "HASH":
@@ -285,7 +330,8 @@ public partial class DefaultFtpCommandHandler
     [
         "ABOR", "ACCT", "ALLO", "APPE", "AUTH", "AVBL", "CDUP", "CLNT",
         "CSID", "CWD", "DELE", "DSIZ", "EPRT", "EPSV", "FEAT", "HASH",
-        "HELP", "HOST", "LANG", "LIST", "LPRT", "LPSV", "MDTM", "MFMT",
+        "HELP", "HOST", "LANG", "LIST", "LPRT", "LPSV", "MDTM",
+        .. (CanSetCreationTime ? (string[])["MFCT"] : []), "MFF", "MFMT",
         "MKD", "MLSD", "MLST", "MODE", "NLST", "NOOP", "OPTS", "PASS",
         "PASV", "PBSZ", "PORT", "PROT", "PWD", "QUIT", "RANG", "REIN",
         "REST", "RETR", "RMD", "RMDA", "RNFR", "RNTO", "SITE", "SIZE",
@@ -473,10 +519,13 @@ public partial class DefaultFtpCommandHandler
         switch (verb)
         {
             case "HELP":
-                return session.WriteMultilineAsync("214", ["The following SITE commands are recognized:", " CHMOD HELP UTIME"], "Help OK.", token);
+                return session.WriteMultilineAsync("214", ["The following SITE commands are recognized:", " " + string.Join(' ', SiteCommands())], "Help OK.", token);
 
             case "CHMOD":
                 return SiteChmodAsync(session, argument, token);
+
+            case "SYMLINK" when options.Current.Features.SiteSymlink:
+                return SiteSymlinkAsync(session, argument, token);
 
             case "UTIME":
                 return SiteUtimeAsync(session, argument, token);
@@ -484,6 +533,20 @@ public partial class DefaultFtpCommandHandler
             default:
                 return session.WriteAsync("504 Command not implemented for that parameter.\r\n"u8, token);
         }
+    }
+
+    /// <summary>The SITE sub-commands on offer, as FEAT and SITE HELP list them.</summary>
+    private IEnumerable<string> SiteCommands()
+    {
+        yield return "CHMOD";
+        yield return "HELP";
+
+        if (options.Current.Features.SiteSymlink)
+        {
+            yield return "SYMLINK";
+        }
+
+        yield return "UTIME";
     }
 
     private ValueTask SiteChmodAsync(FtpSession session, string argument, CancellationToken token)
@@ -562,22 +625,14 @@ public partial class DefaultFtpCommandHandler
             return readOnly;
         }
 
-        // SITE UTIME <pathname> <time-val> (the widely implemented single-timestamp form).
-        var space = argument.LastIndexOf(' ');
-
-        if (space < 0)
+        if (!TryParseSiteUtime(session, argument, out var request))
         {
             return session.WriteAsync("501 Syntax error in parameters or arguments.\r\n"u8, token);
         }
 
-        if (!TryParseTimeVal(argument[(space + 1)..], out var timestamp))
+        if (request.Path is not { } path)
         {
-            return session.WriteAsync("501 Invalid time-val.\r\n"u8, token);
-        }
-
-        if (!SequenceExtensions.TryResolvePath(argument[..space], session.CurrentDirectory, out var path))
-        {
-            return session.WriteAsync("550 Invalid path.\r\n"u8, token);
+            return session.WriteAsync("550 File not found.\r\n"u8, token);
         }
 
         if (TryRejectReadOnlyPath(session, path, out readOnly))
@@ -585,14 +640,14 @@ public partial class DefaultFtpCommandHandler
             return readOnly;
         }
 
-        if (!session.FileSystem.FileExists(path) && !session.FileSystem.DirectoryExists(path))
-        {
-            return session.WriteAsync("550 File not found.\r\n"u8, token);
-        }
-
         try
         {
-            session.FileSystem.SetLastWriteTime(path, timestamp.UtcDateTime);
+            session.FileSystem.SetLastWriteTime(path, request.Modify.UtcDateTime);
+
+            if (request.Access is { } access)
+            {
+                session.FileSystem.SetLastAccessTime(path, access.UtcDateTime);
+            }
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
@@ -600,6 +655,255 @@ public partial class DefaultFtpCommandHandler
         }
 
         return session.WriteAsync("200 SITE UTIME command successful.\r\n"u8, token);
+    }
+
+    /// <summary>A parsed SITE UTIME. <see cref="Path"/> is null when the named object does not exist.</summary>
+    private readonly record struct SiteUtimeRequest(UPath? Path, DateTimeOffset Modify, DateTimeOffset? Access);
+
+    /// <summary>
+    /// Parses the three SITE UTIME forms clients send, none of them standardised.
+    /// </summary>
+    /// <remarks>
+    /// <list type="number">
+    /// <item><c>&lt;path&gt; &lt;atime&gt; &lt;mtime&gt; &lt;ctime&gt; UTC</c> - Pure-FTPd and vsftpd forks, WinSCP.</item>
+    /// <item><c>&lt;YYYYMMDDhhmm[ss]&gt; &lt;path&gt;</c> - ProFTPD mod_site_misc, time first.</item>
+    /// <item><c>&lt;path&gt; &lt;time-val&gt;</c> - the order this server accepted originally.</item>
+    /// </list>
+    /// Pathnames may contain spaces, so the forms are told apart by the shape of the tokens at the
+    /// ends. When both single-timestamp readings parse, the one naming an existing object wins.
+    /// Returns false only for a syntax error; a well-formed request for a missing object comes back
+    /// with a null path.
+    /// </remarks>
+    private static bool TryParseSiteUtime(FtpSession session, string argument, out SiteUtimeRequest request)
+    {
+        request = default;
+
+        var tokens = argument.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+
+        if (tokens.Length < 2)
+        {
+            return false;
+        }
+
+        if (tokens.Length >= 5 &&
+            tokens[^1].Equals("UTC", StringComparison.OrdinalIgnoreCase) &&
+            TryParseSiteTime(tokens[^4], out var access) &&
+            TryParseSiteTime(tokens[^3], out var modify) &&
+            TryParseSiteTime(tokens[^2], out _))
+        {
+            // The pathname is whatever precedes the four trailing tokens, spaces and all.
+            var pathText = argument.TrimEnd();
+
+            for (var i = 0; i < 4; i++)
+            {
+                pathText = pathText[..pathText.LastIndexOf(' ')].TrimEnd();
+            }
+
+            request = new SiteUtimeRequest(Existing(session, pathText), modify, access);
+            return true;
+        }
+
+        var timeFirst = TryParseSiteTime(tokens[0], out var leadingTime)
+            ? Existing(session, argument[tokens[0].Length..].TrimStart())
+            : null;
+
+        var lastSpace = argument.LastIndexOf(' ');
+        var timeLast = TryParseSiteTime(argument[(lastSpace + 1)..], out var trailingTime)
+            ? Existing(session, argument[..lastSpace].TrimEnd())
+            : null;
+
+        if (timeFirst is not null)
+        {
+            request = new SiteUtimeRequest(timeFirst, leadingTime, null);
+            return true;
+        }
+
+        if (timeLast is not null)
+        {
+            request = new SiteUtimeRequest(timeLast, trailingTime, null);
+            return true;
+        }
+
+        // Well-formed but naming nothing: report the missing object rather than the syntax.
+        if (TryParseSiteTime(tokens[0], out leadingTime) || TryParseSiteTime(tokens[^1], out trailingTime))
+        {
+            request = new SiteUtimeRequest(null, default, null);
+            return true;
+        }
+
+        return false;
+
+        static UPath? Existing(FtpSession session, string pathText)
+        {
+            if (pathText.Length == 0 ||
+                !SequenceExtensions.TryResolvePath(pathText, session.CurrentDirectory, out var path))
+            {
+                return null;
+            }
+
+            // The cast matters: a bare null would convert to an empty UPath through its implicit
+            // conversion from string, rather than to "no path".
+            return session.FileSystem.FileExists(path) || session.FileSystem.DirectoryExists(path)
+                ? path
+                : (UPath?)null;
+        }
+    }
+
+    /// <summary>
+    /// A SITE UTIME timestamp: an RFC 3659 time-val, or ProFTPD's minute-precision
+    /// YYYYMMDDhhmm. Always UTC.
+    /// </summary>
+    private static bool TryParseSiteTime(string value, out DateTimeOffset timestamp)
+    {
+        if (value.Length == 12 && value.AsSpan().IndexOfAnyExceptInRange('0', '9') < 0)
+        {
+            value += "00";
+        }
+
+        return TryParseTimeVal(value, out timestamp);
+    }
+
+    /// <summary>
+    /// SITE SYMLINK &lt;target&gt; &lt;link&gt; (ProFTPD mod_site_misc; Beyond Compare quotes both).
+    /// </summary>
+    /// <remarks>
+    /// The target is resolved like any other pathname - relative to the link's directory, clamped
+    /// at the root - and must already exist, inside the same mount as the link. The link stores a
+    /// relative path, so it survives the tree being moved, and can never name anything the session
+    /// could not reach through the tree itself. Reading through it is still subject to the jail.
+    /// </remarks>
+    private ValueTask SiteSymlinkAsync(FtpSession session, string argument, CancellationToken token)
+    {
+        if (TryRejectAnonymous(session, FtpCommand.SiteSpecificCommands, out var rejected))
+        {
+            return rejected;
+        }
+
+        if (TryRejectReadOnly(session, out var readOnly))
+        {
+            return readOnly;
+        }
+
+        if (!TrySplitTwoPathnames(argument, out var targetText, out var linkText) ||
+            !SequenceExtensions.TryResolvePath(linkText, session.CurrentDirectory, out var link) ||
+            link == UPath.Root ||
+            !SequenceExtensions.TryResolvePath(targetText, link.GetDirectory(), out var target))
+        {
+            return session.WriteAsync("501 Syntax error in parameters or arguments.\r\n"u8, token);
+        }
+
+        if (TryRejectReadOnlyPath(session, link, out readOnly))
+        {
+            return readOnly;
+        }
+
+        var fileSystem = session.FileSystem;
+        var targetIsDirectory = fileSystem.DirectoryExists(target);
+
+        if (!targetIsDirectory && !fileSystem.FileExists(target))
+        {
+            return session.WriteAsync("550 Link target not found.\r\n"u8, token);
+        }
+
+        if (fileSystem.FileExists(link) || fileSystem.DirectoryExists(link))
+        {
+            return session.WriteAsync("553 Requested action not taken: the link name already exists.\r\n"u8, token);
+        }
+
+        if (!fileSystem.DirectoryExists(link.GetDirectory()))
+        {
+            return session.WriteAsync("550 Directory not found.\r\n"u8, token);
+        }
+
+        // Each mount is its own physical tree, so a link from one into another would land outside
+        // the tree that contains it - which the link check then refuses to follow anyway.
+        if (fileSystem is Zio.FileSystems.MountFileSystem mounts)
+        {
+            // An unmounted path belongs to the home tree, and comes back with no mount name.
+            mounts.TryGetMount(link, out var linkMount, out _, out _);
+            mounts.TryGetMount(target, out var targetMount, out _, out _);
+
+            if (linkMount != targetMount)
+            {
+                return session.WriteAsync("550 Requested action not taken: the link and its target are in different folders.\r\n"u8, token);
+            }
+        }
+
+        try
+        {
+            // Both conversions run the containment check, so neither end can name a host path
+            // outside the tree.
+            var linkPath = fileSystem.ConvertPathToInternal(link);
+            var targetPath = fileSystem.ConvertPathToInternal(target);
+            var relative = Path.GetRelativePath(Path.GetDirectoryName(linkPath)!, targetPath);
+
+            if (targetIsDirectory)
+            {
+                Directory.CreateSymbolicLink(linkPath, relative);
+            }
+            else
+            {
+                File.CreateSymbolicLink(linkPath, relative);
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or NotSupportedException)
+        {
+            // On Windows, creating a symbolic link needs Developer Mode or the privilege for it.
+            return session.WriteAsync("550 Requested action not taken: the link could not be created.\r\n"u8, token);
+        }
+
+        return session.WriteAsync("200 SITE SYMLINK command successful.\r\n"u8, token);
+    }
+
+    /// <summary>
+    /// Splits "&lt;a&gt; &lt;b&gt;" where either may be quoted (with "" for a literal quote). An
+    /// unquoted last argument takes the rest of the line, spaces included. The quotes are kept, for
+    /// the path resolver to remove.
+    /// </summary>
+    private static bool TrySplitTwoPathnames(string argument, out string first, out string second)
+    {
+        first = second = string.Empty;
+        argument = argument.Trim();
+
+        int end;
+
+        if (argument.StartsWith('"'))
+        {
+            end = 1;
+
+            while (true)
+            {
+                end = argument.IndexOf('"', end);
+
+                if (end < 0)
+                {
+                    return false;
+                }
+
+                // A doubled quote is a literal quote inside the name.
+                if (end + 1 < argument.Length && argument[end + 1] == '"')
+                {
+                    end += 2;
+                    continue;
+                }
+
+                end++;
+                break;
+            }
+        }
+        else
+        {
+            end = argument.IndexOf(' ');
+
+            if (end < 0)
+            {
+                return false;
+            }
+        }
+
+        first = argument[..end];
+        second = argument[end..].Trim();
+        return first.Length > 0 && second.Length > 0;
     }
 
     private static bool TryParseOctal(string value, out int result)

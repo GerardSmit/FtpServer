@@ -72,6 +72,12 @@ public sealed class FtpSession(
     /// <summary>True once the control connection has been upgraded by AUTH TLS.</summary>
     public bool IsProtected { get; set; }
 
+    /// <summary>
+    /// True for a connection to the implicit FTPS port: TLS from the first byte, which REIN does
+    /// not drop and AUTH cannot renegotiate.
+    /// </summary>
+    public bool IsImplicitTls { get; set; }
+
     // ---- login state ------------------------------------------------------
 
     public bool IsAuthenticated { get; private set; }
@@ -116,6 +122,8 @@ public sealed class FtpSession(
         RenameFrom = null;
         RestartOffset = 0;
         TransferType = DefaultTransferType;
+        TransferMode = FtpTransferMode.Stream;
+        DeflateLevel = DefaultDeflateLevel;
         ActiveDataIp = null;
         HashRange = null;
         DataStreamProvider = FtpDataStreamProvider.Active;
@@ -133,19 +141,31 @@ public sealed class FtpSession(
         EpsvAll = false;
         EnabledFacts = MlsxFacts.Default;
         VirtualHost = null;
-        TlsServerName = null;
         Encoding = DefaultEncoding;
         HashAlgorithm = DefaultHashAlgorithm;
+
+        // An implicit connection keeps its TLS session through REIN, and with it the name the
+        // client asked for in the handshake.
+        if (!IsImplicitTls)
+        {
+            TlsServerName = null;
+        }
 
         ResetProtectionParameters();
     }
 
-    /// <summary>Forgets the PBSZ/PROT negotiation, leaving data connections in the clear.</summary>
+    /// <summary>
+    /// Forgets the PBSZ/PROT negotiation: data connections go back to the clear, or on an
+    /// implicit connection to the protected default that connection started with.
+    /// </summary>
     public void ResetProtectionParameters()
     {
         BufferSize = 0;
-        ProtectionBufferNegotiated = false;
-        DataConnectionMode = FtpDataConnectionMode.Clear;
+
+        // Implicit FTPS clients expect protected data connections without asking, and some send
+        // PROT without the PBSZ that would otherwise have to come first.
+        ProtectionBufferNegotiated = IsImplicitTls;
+        DataConnectionMode = IsImplicitTls ? FtpDataConnectionMode.Private : FtpDataConnectionMode.Clear;
     }
 
     public bool CanWrite => !IsReadOnly;
@@ -183,6 +203,14 @@ public sealed class FtpSession(
     // ---- transfer state ---------------------------------------------------
 
     public FtpTransferType TransferType { get; set; } = DefaultTransferType;
+
+    /// <summary>Set by MODE; Deflate compresses the data connection (MODE Z).</summary>
+    public FtpTransferMode TransferMode { get; set; }
+
+    /// <summary>zlib compression level for MODE Z, set with "OPTS MODE Z LEVEL n" (0-9).</summary>
+    public int DeflateLevel { get; set; } = DefaultDeflateLevel;
+
+    public const int DefaultDeflateLevel = 6;
 
     /// <summary>Pathname captured by RNFR, awaiting RNTO.</summary>
     public UPath? RenameFrom { get; set; }
@@ -434,6 +462,15 @@ public sealed class FtpSession(
         _writeLock.Dispose();
         FileSystem.Dispose();
     }
+}
+
+public enum FtpTransferMode
+{
+    /// <summary>MODE S - the file as a plain byte stream, ended by closing the connection.</summary>
+    Stream,
+
+    /// <summary>MODE Z - the stream compressed with zlib (RFC 1950/1951).</summary>
+    Deflate,
 }
 
 public enum FtpTransferType
