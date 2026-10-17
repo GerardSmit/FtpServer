@@ -315,6 +315,14 @@ public static class SequenceExtensions
             }
         }
 
+        // "..." and longer runs of dots are legal Unix names, but Zio's UPath refuses any segment
+        // made only of dots other than "." and "..", so they are rejected here rather than thrown
+        // from the UPath constructor.
+        if (segment.AsSpan().IndexOfAnyExcept('.') < 0)
+        {
+            return false;
+        }
+
         if (!OperatingSystem.IsWindows())
         {
             // On Unix the characters below are ordinary filename bytes.
