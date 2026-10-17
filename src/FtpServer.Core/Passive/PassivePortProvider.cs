@@ -1,5 +1,4 @@
-﻿using System.Collections.Concurrent;
-using System.Diagnostics.CodeAnalysis;
+using System.Collections.Concurrent;
 using System.Net;
 using FtpServer.Options;
 using Microsoft.Extensions.Logging;
@@ -13,34 +12,58 @@ public class PassivePortProvider(IOptions<FtpOptions> options, ILogger<PassiveSo
 
     public async Task StopAllAsync()
     {
-        var tasks = new List<Task>(_passiveSockets.Count);
+        var tasks = new List<ValueTask>(_passiveSockets.Count);
 
         foreach (var passiveSocket in _passiveSockets.Values)
         {
-            tasks.Add(passiveSocket.StopListeningAsync());
+            // DisposeAsync stops the listener and then releases its semaphore and token source,
+            // which StopListeningAsync alone would leave behind.
+            tasks.Add(passiveSocket.DisposeAsync());
         }
 
-        await Task.WhenAll(tasks);
+        foreach (var task in tasks)
+        {
+            try
+            {
+                await task;
+            }
+            catch
+            {
+                // Shutdown is best effort.
+            }
+        }
+
+        _passiveSockets.Clear();
     }
 
-    public bool TryRent(IPAddress? targetAddress, [NotNullWhen(true)] out PassiveSocketOwner? socketOwner)
+    /// <summary>
+    /// Reserves a port for a data connection expected from <paramref name="targetAddress"/>.
+    /// </summary>
+    public async ValueTask<PassiveSocketOwner?> TryRentAsync(IPAddress? targetAddress)
     {
         var range = options.Value.PassivePortRange;
+        var count = range.End - range.Start + 1;
 
-        for (var port = range.Start; port <= range.End; port++)
+        // Scanning from a random position keeps the next data port unpredictable; from the bottom
+        // of the range, a quiet server hands nearly every transfer the same port to race for.
+        var offset = Random.Shared.Next(count);
+
+        for (var i = 0; i < count; i++)
         {
-            if (!_passiveSockets.TryGetValue(port, out var passiveSocket))
-            {
-                passiveSocket = _passiveSockets.GetOrAdd(port, new PassiveSocket(port, logger));
-            }
+            var port = range.Start + (offset + i) % count;
 
-            if (passiveSocket.TryRent(targetAddress, out socketOwner))
+            // GetOrAdd with a factory avoids constructing a PassiveSocket on every probe.
+            var passiveSocket = _passiveSockets.GetOrAdd(
+                port,
+                static (p, state) => new PassiveSocket(p, state),
+                logger);
+
+            if (await passiveSocket.TryRentAsync(targetAddress).ConfigureAwait(false) is { } owner)
             {
-                return true;
+                return owner;
             }
         }
 
-        socketOwner = null;
-        return false;
+        return null;
     }
 }

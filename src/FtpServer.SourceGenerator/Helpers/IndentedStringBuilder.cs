@@ -6,6 +6,12 @@ namespace FtpServer.SourceGenerator.Helpers;
 
 public class IndentedStringBuilder
 {
+    /// <summary>
+    /// Fixed rather than <see cref="Environment.NewLine"/>, so generated sources are
+    /// byte-identical on every platform.
+    /// </summary>
+    private const string NewLine = "\n";
+
     private readonly ConcurrentDictionary<int, string> indentCache = new();
 
     private int spaces;
@@ -56,7 +62,7 @@ public class IndentedStringBuilder
                 }
                 else
                 {
-                    Builder.AppendLine();
+                    Builder.Append(NewLine);
                     Builder.Append(indent);
                 }
 
@@ -82,7 +88,7 @@ public class IndentedStringBuilder
             throw new ArgumentException("AppendEnd must not contain multiple lines");
         }
 
-        Builder.AppendLine(text.TrimEnd());
+        Builder.Append(text.TrimEnd()).Append(NewLine);
         return this;
     }
 
@@ -91,12 +97,12 @@ public class IndentedStringBuilder
         if (text.HasNewLine())
         {
             Append(text);
-            Builder.AppendLine();
+            Builder.Append(NewLine);
         }
         else
         {
             Builder.Append(indent);
-            Builder.AppendLine(text);
+            Builder.Append(text).Append(NewLine);
         }
 
         return this;

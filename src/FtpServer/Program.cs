@@ -1,27 +1,27 @@
-﻿using FtpServer;
-using FtpServer.Options;
-using Microsoft.Extensions.Configuration;
-using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Hosting;
-using Microsoft.Extensions.Logging;
+﻿using System.CommandLine;
+using FtpServer;
+using FtpServer.Configuration;
 
-var builder = Host.CreateEmptyApplicationBuilder(new HostApplicationBuilderSettings
+var configOption = new Option<string>("--config")
 {
-    Args = args
-});
+    Description = "Settings file to read, and for the management commands, to write.",
+    Recursive = true,
+    DefaultValueFactory = _ => ServerRunner.DefaultConfigPath,
+};
 
+var root = new RootCommand("FTP server. Run without a command to start serving.")
+{
+    configOption,
+};
 
-builder.Logging.AddConsole();
-builder.Configuration.AddCommandLine(args);
-builder.Configuration.AddEnvironmentVariables("FTP_");
-builder.Configuration.AddJsonFile("appsettings.json", optional: true);
-builder.Configuration.AddJsonFile("appsettings.Development.json", optional: true);
+// Unmatched tokens are how "--Port 2121" and every other setting still reaches the configuration
+// when the server is started with no verb.
+root.TreatUnmatchedTokensAsErrors = false;
 
-builder.Services.AddFtpServer();
+root.SetAction((parseResult, token) =>
+    ServerRunner.RunAsync(parseResult.GetValue(configOption)!, parseResult.UnmatchedTokens, token));
 
-builder.Services.AddOptions<FtpOptions>()
-    .Bind(builder.Configuration);
+root.Add(UserCommands.CreateUserCommand(configOption));
+root.Add(UserCommands.CreateHashCommand());
 
-var app = builder.Build();
-
-app.Run();
+return await root.Parse(args).InvokeAsync();

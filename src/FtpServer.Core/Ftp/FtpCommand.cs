@@ -573,6 +573,15 @@ public enum FtpCommand
     ChangeToParentDirectoryExtended,
 
     /// <summary>
+    /// Change working directory.
+    /// </summary>
+    /// <remarks>
+    /// RFC 775
+    /// </remarks>
+    [FtpCommand("XCWD")]
+    ChangeWorkingDirectoryExtended,
+
+    /// <summary>
     /// Make a directory.
     /// </summary>
     /// <remarks>
@@ -637,4 +646,67 @@ public enum FtpCommand
     /// </remarks>
     [FtpCommand("XCRC")]
     CalculateCrc32Checksum,
+
+    /// <summary>
+    /// Identify the client software.
+    /// </summary>
+    /// <remarks>
+    /// Non-standard command, sent by Total Commander, lftp and FileZilla
+    /// </remarks>
+    [FtpCommand("CLNT")]
+    ClientName,
+
+    /// <summary>
+    /// Compute a checksum of a file using the algorithm selected by "OPTS HASH".
+    /// </summary>
+    /// <remarks>
+    /// draft-bryan-ftpext-hash
+    /// </remarks>
+    [FtpCommand("HASH")]
+    Hash,
+
+    /// <summary>
+    /// Select the byte range used by the next HASH command.
+    /// </summary>
+    /// <remarks>
+    /// draft-bryan-ftpext-hash
+    /// </remarks>
+    [FtpCommand("RANG")]
+    HashRange,
+
+    /// <summary>
+    /// Calculate MD5 checksum.
+    /// </summary>
+    /// <remarks>
+    /// Non-standard command
+    /// </remarks>
+    [FtpCommand("XMD5")]
+    CalculateMd5Checksum,
+
+    /// <summary>
+    /// Calculate SHA-1 checksum.
+    /// </summary>
+    /// <remarks>
+    /// Non-standard command
+    /// </remarks>
+    [FtpCommand("XSHA1")]
+    CalculateSha1Checksum,
+
+    /// <summary>
+    /// Calculate SHA-256 checksum.
+    /// </summary>
+    /// <remarks>
+    /// Non-standard command
+    /// </remarks>
+    [FtpCommand("XSHA256")]
+    CalculateSha256Checksum,
+
+    /// <summary>
+    /// Calculate SHA-512 checksum.
+    /// </summary>
+    /// <remarks>
+    /// Non-standard command
+    /// </remarks>
+    [FtpCommand("XSHA512")]
+    CalculateSha512Checksum,
 }

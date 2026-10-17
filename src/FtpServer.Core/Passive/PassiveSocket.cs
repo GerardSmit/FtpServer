@@ -6,54 +6,69 @@ using Microsoft.Extensions.Logging;
 
 namespace FtpServer;
 
-public class PassiveSocket(int port, ILogger<PassiveSocket> logger)
+public sealed class PassiveSocket(int port, ILogger<PassiveSocket> logger) : IAsyncDisposable
 {
     private readonly ConcurrentDictionary<IPAddress, PassiveSocketOwner> _activeSockets = new();
-    private readonly SemaphoreSlim _semaphore = new(1);
+    private readonly SemaphoreSlim _semaphore = new(1, 1);
+    private readonly CancellationTokenSource _cancellationTokenSource = new();
     private PassiveSocketOwner? _globalSocketOwner;
     private Task? _backgroundTask;
-    private readonly CancellationTokenSource _cancellationTokenSource = new();
-    private bool _invalid;
+    private volatile bool _invalid;
 
     public int Port => port;
 
-    private void StartListening()
+    private async ValueTask<bool> EnsureListeningAsync()
     {
-        if (_backgroundTask != null)
-        {
-            // Already listening
-            return;
-        }
-
         if (_invalid)
         {
-            // Socket is invalid, don't start listening again
-            return;
+            return false;
         }
 
-        _semaphore.Wait();
+        if (Volatile.Read(ref _backgroundTask) is not null)
+        {
+            return true;
+        }
+
+        await _semaphore.WaitAsync().ConfigureAwait(false);
 
         try
         {
-            _cancellationTokenSource.Token.ThrowIfCancellationRequested();
-
-            if (_backgroundTask != null)
+            if (_invalid)
             {
-                return;
+                return false;
             }
 
+            if (_backgroundTask is not null)
+            {
+                return true;
+            }
+
+            _cancellationTokenSource.Token.ThrowIfCancellationRequested();
+
             var socket = new Socket(AddressFamily.InterNetworkV6, SocketType.Stream, ProtocolType.Tcp);
-            socket.SetSocketOption(SocketOptionLevel.IPv6, SocketOptionName.IPv6Only, false);
-            socket.Bind(new IPEndPoint(IPAddress.IPv6Any, port));
-            socket.Listen(10);
-            _backgroundTask = BackgroundTaskAsync(socket);
+
+            try
+            {
+                socket.SetSocketOption(SocketOptionLevel.IPv6, SocketOptionName.IPv6Only, false);
+                socket.Bind(new IPEndPoint(IPAddress.IPv6Any, port));
+                socket.Listen(10);
+            }
+            catch
+            {
+                // A failed bind must not leave the half-built listener to the finalizer.
+                socket.Dispose();
+                throw;
+            }
+
+            Volatile.Write(ref _backgroundTask, BackgroundTaskAsync(socket));
+            return true;
         }
         catch (Exception e)
         {
-            // Most likely the port is already in use
+            // Most likely the port is already in use; skip it for the lifetime of the process.
             _invalid = true;
-
             Log.CouldNotStartPassiveSocket(logger, e);
+            return false;
         }
         finally
         {
@@ -63,22 +78,22 @@ public class PassiveSocket(int port, ILogger<PassiveSocket> logger)
 
     public async Task StopListeningAsync()
     {
-        await _semaphore.WaitAsync();
+        await _semaphore.WaitAsync().ConfigureAwait(false);
 
         try
         {
-            if (_backgroundTask == null)
+            if (_backgroundTask is not { } task)
             {
                 return;
             }
 
             await _cancellationTokenSource.CancelAsync();
-            await _backgroundTask;
+            await task;
             _backgroundTask = null;
         }
         catch
         {
-            // Ignore
+            // Shutdown is best effort.
         }
         finally
         {
@@ -86,146 +101,156 @@ public class PassiveSocket(int port, ILogger<PassiveSocket> logger)
         }
     }
 
+    private const int MaxConsecutiveAcceptFailures = 20;
+
     private async Task BackgroundTaskAsync(Socket serverSocket)
     {
         var token = _cancellationTokenSource.Token;
-
-        while (!token.IsCancellationRequested)
-        {
-            try
-            {
-                var socket = await serverSocket.AcceptAsync(token);
-                var targetAddress = (socket.RemoteEndPoint as IPEndPoint)?.Address;
-
-                SetSocket(targetAddress, socket);
-            }
-            catch (OperationCanceledException)
-            {
-                break;
-            }
-            catch(Exception ex)
-            {
-                Log.CouldNotAcceptPassiveSocket(logger, ex);
-            }
-        }
-
-        CancelOwners();
+        var consecutiveFailures = 0;
 
         try
         {
-            serverSocket.Dispose();
+            while (!token.IsCancellationRequested)
+            {
+                Socket socket;
+
+                try
+                {
+                    socket = await serverSocket.AcceptAsync(token);
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+                catch (ObjectDisposedException)
+                {
+                    // The listener was torn down underneath us.
+                    break;
+                }
+                catch (SocketException ex)
+                {
+                    // A per-connection failure (a peer resetting while still in the backlog) says
+                    // nothing about the listener; abandoning the loop would leave the port
+                    // rentable but unable to accept.
+                    Log.CouldNotAcceptPassiveSocket(logger, ex);
+
+                    // A listener-level fault (descriptor exhaustion, ENOBUFS) fails instantly and
+                    // repeatedly, so retrying without pause would spin a core and flood the log.
+                    if (++consecutiveFailures >= MaxConsecutiveAcceptFailures)
+                    {
+                        break;
+                    }
+
+                    await Task.Delay(TimeSpan.FromMilliseconds(50), token).ConfigureAwait(false);
+                    continue;
+                }
+                catch (Exception ex)
+                {
+                    Log.CouldNotAcceptPassiveSocket(logger, ex);
+                    break;
+                }
+
+                consecutiveFailures = 0;
+
+                if (!TryHandOff(socket))
+                {
+                    // Nobody is waiting for this connection - close it rather than leaking the socket.
+                    Log.UnmatchedPassiveConnection(logger, (socket.RemoteEndPoint as IPEndPoint)?.Address);
+                    try { socket.Dispose(); } catch { /* already gone */ }
+                }
+            }
         }
-        catch
+        finally
         {
-            // Ignore
+            // Whatever ended the loop, this port can no longer accept. Marking it invalid stops
+            // TryRentAsync handing out a dead port ahead of every working one.
+            _invalid = true;
+
+            CancelOwners();
+
+            try { serverSocket.Dispose(); } catch { /* already gone */ }
         }
     }
 
     private void CancelOwners()
     {
-        try
-        {
-            _globalSocketOwner?.Cancel();
-        }
-        catch
-        {
-            // Ignore
-        }
+        Interlocked.Exchange(ref _globalSocketOwner, null)?.Cancel();
 
-        foreach (var socketOwner in _activeSockets.Values)
+        foreach (var key in _activeSockets.Keys)
         {
-            try
+            if (_activeSockets.TryRemove(key, out var socketOwner))
             {
                 socketOwner.Cancel();
             }
-            catch
-            {
-                // Ignore
-            }
         }
     }
 
-    private void SetSocket(IPAddress? targetAddress, Socket socket)
+    private bool TryHandOff(Socket socket)
     {
-        if (targetAddress == null)
+        var targetAddress = (socket.RemoteEndPoint as IPEndPoint)?.Address;
+
+        if (targetAddress is not null)
         {
-            _globalSocketOwner?.SetSocket(socket);
-            return;
-        }
-
-        if (_activeSockets.TryGetValue(targetAddress, out var socketOwner))
-        {
-            socketOwner.SetSocket(socket);
-            return;
-        }
-
-        if (targetAddress.IsIPv4MappedToIPv6 &&
-            _activeSockets.TryGetValue(targetAddress.MapToIPv4(), out socketOwner))
-        {
-            socketOwner.SetSocket(socket);
-            return;
-        }
-
-        _globalSocketOwner?.SetSocket(socket);
-    }
-
-    public bool TryRent(IPAddress? targetAddress, [NotNullWhen(true)] out PassiveSocketOwner? socketOwner)
-    {
-        if (_invalid)
-        {
-            socketOwner = null;
-            return false;
-        }
-
-        StartListening();
-
-        // Global IP adres
-        if (targetAddress == null)
-        {
-            if (_globalSocketOwner != null)
+            if (_activeSockets.TryGetValue(targetAddress, out var socketOwner) && socketOwner.SetSocket(socket))
             {
-                socketOwner = null;
-                return false;
+                return true;
             }
 
-            socketOwner = new PassiveSocketOwner(targetAddress, this);
-
-            if (Interlocked.CompareExchange(ref _globalSocketOwner, socketOwner, null) != null)
+            if (targetAddress.IsIPv4MappedToIPv6 &&
+                _activeSockets.TryGetValue(targetAddress.MapToIPv4(), out socketOwner) &&
+                socketOwner.SetSocket(socket))
             {
-                socketOwner = null;
-                return false;
+                return true;
             }
-
-            return true;
         }
 
-        // Specific IP adres
-        if (_activeSockets.TryGetValue(targetAddress, out socketOwner))
-        {
-            socketOwner = null;
-            return false;
-        }
-
-        socketOwner = new PassiveSocketOwner(targetAddress, this);
-
-        if (!_activeSockets.TryAdd(targetAddress, socketOwner))
-        {
-            socketOwner = null;
-            return false;
-        }
-
-        return true;
+        return Volatile.Read(ref _globalSocketOwner) is { } global && global.SetSocket(socket);
     }
 
-    public void Release(IPAddress? targetAddress)
+    public async ValueTask<PassiveSocketOwner?> TryRentAsync(IPAddress? targetAddress)
     {
-        if (targetAddress == null)
+        if (!await EnsureListeningAsync().ConfigureAwait(false))
         {
-            _globalSocketOwner = null;
+            return null;
         }
-        else
+
+        if (targetAddress is null)
         {
-            _activeSockets.TryRemove(targetAddress, out _);
+            var candidate = new PassiveSocketOwner(null, this);
+
+            if (Interlocked.CompareExchange(ref _globalSocketOwner, candidate, null) is not null)
+            {
+                return null;
+            }
+
+            return candidate;
         }
+
+        var owner = new PassiveSocketOwner(targetAddress, this);
+        return _activeSockets.TryAdd(targetAddress, owner) ? owner : null;
+    }
+
+    /// <summary>
+    /// Releases a rented slot. The owner is passed so a late release from an abandoned session
+    /// cannot unregister the live owner that replaced it.
+    /// </summary>
+    public void Release(IPAddress? targetAddress, PassiveSocketOwner owner)
+    {
+        if (targetAddress is null)
+        {
+            Interlocked.CompareExchange(ref _globalSocketOwner, null, owner);
+            return;
+        }
+
+        // Only removes the entry when it is still the one this owner registered.
+        ((ICollection<KeyValuePair<IPAddress, PassiveSocketOwner>>)_activeSockets)
+            .Remove(new KeyValuePair<IPAddress, PassiveSocketOwner>(targetAddress, owner));
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        await StopListeningAsync();
+        _cancellationTokenSource.Dispose();
+        _semaphore.Dispose();
     }
 }

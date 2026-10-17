@@ -1,0 +1,35 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <TargetFramework>net10.0</TargetFramework>
+        <RootNamespace>FtpServer.Tests</RootNamespace>
+        <IsPackable>false</IsPackable>
+        <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+        <!-- The fixture drives its own timeouts; the analyzer's suggestion does not apply. -->
+        <NoWarn>$(NoWarn);xUnit1051</NoWarn>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <Content Include="xunit.runner.json" CopyToOutputDirectory="PreserveNewest" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
+        <PackageReference Include="xunit.v3" Version="3.1.0" />
+        <PackageReference Include="xunit.runner.visualstudio" Version="3.1.4" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <!-- The Kestrel front-end is exercised for real, not only compiled. -->
+        <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <ProjectReference Include="..\..\src\FtpServer.Core\FtpServer.Core.csproj" />
+        <ProjectReference Include="..\..\src\FtpServer.Sockets\FtpServer.Sockets.csproj" />
+        <ProjectReference Include="..\..\src\FtpServer.Kestrel\FtpServer.Kestrel.csproj" />
+        <!-- The management CLI edits the settings file the server reads, so it is tested too. -->
+        <ProjectReference Include="..\..\src\FtpServer\FtpServer.csproj" />
+    </ItemGroup>
+
+</Project>

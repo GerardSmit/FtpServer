@@ -1,0 +1,7 @@
+{
+  "$schema": "https://xunit.net/schema/current/xunit.runner.schema.json",
+
+  "//": "Each test starts a real server with its own listener and passive port block. At full CPU parallelism ~30 of those compete, which starves the short wall-clock timers several tests assert on (idle timeout, lockout expiry) and makes them flake. Four at a time keeps the suite quick without that contention.",
+  "maxParallelThreads": 4,
+  "parallelizeAssembly": false
+}

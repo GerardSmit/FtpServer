@@ -9,7 +9,9 @@ namespace FtpServer.Pipelines;
 internal sealed class SslDuplexPipe : DuplexPipeStreamAdapter<SslStream>
 {
     public SslDuplexPipe(IDuplexPipe transport, StreamPipeReaderOptions readerOptions, StreamPipeWriterOptions writerOptions)
-        : this(transport, readerOptions, writerOptions, s => new SslStream(s))
+        // The inner stream is the adapter itself, whose Dispose is not supported: letting
+        // SslStream close it turns an ordinary teardown into an exception.
+        : this(transport, readerOptions, writerOptions, s => new SslStream(s, leaveInnerStreamOpen: true))
     {
     }
 

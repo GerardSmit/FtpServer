@@ -1,51 +1,248 @@
 # FtpServer in .NET
 FTP(S) server implementation in C# / .NET
 
-> **Note:** This project is still in experimental stage and not ready for production use.
+> **Note:** This project is still experimental. It is no longer unsafe by default, but it has not
+> been through a security audit or a production deployment. Review the configuration before
+> exposing it to an untrusted network.
 
 ## Features
-The following features are supported by the FTP server:
 
 **Server**
-- NativeAOT support
+- NativeAOT support (a ~6 MB self-contained executable)
 - Linux and Windows support
-- Custom path for FTP root directory
-- Auto disconnect client after idle time
+- Custom path for the FTP root directory, confined with a sub-filesystem jail that also refuses
+  junctions and symbolic links leading out of it (set `FollowLinks` to treat the root as a mapping
+  and follow them; hard links are outside what either setting can control)
+- Username/password authentication, optional anonymous access, per-user home directories
+- Virtual folders: any directory on the host, mounted anywhere in the tree, optionally read-only —
+  server-wide or per user
+- A management CLI (`FtpServer user add`) that writes hashed accounts into the settings file, which
+  the running server picks up without a restart
+- PBKDF2 password hashes (`PasswordHash`); the plain and SHA-256 forms still work and warn at startup
+- Read-only mode, connection limits, idle timeouts and failed-login throttling
+- Two hosting front-ends: raw sockets (default) and Kestrel
 
 **FTP**
-- FTPS (FTP over SSL) support
-- Active and Passive mode support
-- Basic FTP commands support
-  - PWD
-  - CWD
-  - LIST
-  - LIST -R
-  - RETR
-  - STOR
-  - PORT
-  - EPRT
-  - PROT
-  - PASV
-  - EPSV
-  - XCRC
+- FTPS (explicit `AUTH TLS`), with optional TLS on the data connection and session resumption
+  across the two (so clients that require it, such as FileZilla, are satisfied)
+- Active and passive mode, including IPv6 (`EPRT`/`EPSV`) and the long forms (`LPRT`/`LPSV`)
+- UTF-8 pathnames (RFC 2640)
 
-More features will be added in the future.
+### Supported commands
 
-Note: the server has only been tested with FileZilla FTP client on Windows.
+| Area | Commands |
+|---|---|
+| Access control | `USER` `PASS` `ACCT` `REIN` `QUIT` `HOST` |
+| Security | `AUTH` `PBSZ` `PROT` |
+| Navigation | `CWD` `CDUP` `PWD` `MKD` `RMD` `RMDA` `DELE` `RNFR` `RNTO` `XCUP` `XMKD` `XPWD` `XRMD` |
+| Transfer setup | `TYPE` `MODE` `STRU` `ALLO` `REST` `PORT` `EPRT` `LPRT` `PASV` `EPSV` `LPSV` |
+| Transfers | `RETR` `STOR` `STOU` `APPE` `ABOR` |
+| Listings | `LIST` (incl. `-R` and a pathname) `NLST` `MLSD` `MLST` `STAT` |
+| Metadata | `SIZE` `MDTM` `MFMT` `AVBL` `DSIZ` |
+| Checksums | `HASH` `RANG` `XCRC` `XMD5` `XSHA1` `XSHA256` `XSHA512` |
+| Informational | `FEAT` `OPTS` `HELP` `SYST` `NOOP` `SITE` (`CHMOD`/`HELP`/`UTIME`) `LANG` `CLNT` `CSID` |
+
+Deliberately answered `502`: `SMNT`, `SPSV`, `THMB`, `MFCT`, `MFF`, `XRCP`, `XRSQ`, `XSEM`, `XSEN`,
+and the RFC 2228 mechanisms that TLS does not use (`ADAT`, `MIC`, `CONF`, `ENC`). `CCC` answers
+`534` rather than dropping the control connection back to cleartext.
+
+Exercised by an integration suite that drives the protocol at the byte level, and by two
+independent client implementations in CI: `curl` (plain and explicit FTPS, including `REST`
+resume and `NLST`) and `System.Net.FtpWebRequest`. FileZilla and WinSCP have **not** been tested;
+the commands they rely on are covered individually, but nobody has driven a real session with them.
+
+## Configuration
+
+Settings come from `appsettings.json`, then `FTP_`-prefixed environment variables, then the
+command line — later sources win.
+
+```jsonc
+{
+  "Port": 21,
+  "Path": "ftproot",          // never "/" — the server refuses to start
+  "Passive": true,
+  "Ftps": false,
+  "RequireTls": false,        // reject USER/PASS until AUTH TLS has run
+  "ReadOnly": false,
+
+  "FollowLinks": false,       // follow junctions/symlinks that lead outside Path
+
+  "VirtualFolders": [         // mounted for every session; users can add or override their own
+    { "Path": "/public", "PhysicalPath": "D:/data/public", "ReadOnly": true }
+  ],
+
+  "Authentication": {
+    "AllowAnonymous": false,
+    "AnonymousCanWrite": false,
+    "MaxFailedAttempts": 5,
+    "Users": [
+      {
+        "Name": "alice",
+        "PasswordHash": "pbkdf2-sha256$210000$<salt>$<hash>",
+        "HomeDirectory": "alice",
+        "VirtualFolders": [
+          { "Path": "/shared",  "PhysicalPath": "D:/data/shared" },
+          { "Path": "/archive", "PhysicalPath": "D:/data/archive", "ReadOnly": true }
+        ]
+      }
+    ]
+  },
+
+  "Connection": {
+    "MaxConnections": 100,
+    "MaxConnectionsPerAddress": 10,
+    "MaxCommandLength": 4096,
+    "IdleTimeout": "00:05:00"
+  },
+
+  "DataConnection": {
+    "AllowForeignHost": false,   // leave off: this is what blocks the FTP bounce attack
+    "MinimumPort": 1024,
+    "VerifyPeerAddress": true,
+    "PublicAddress": null,       // public IP advertised in PASV replies when behind NAT
+    "Timeout": "00:00:30"
+  },
+
+  "Certificate": {
+    "Path": "server.pfx",        // omit to generate a self-signed certificate
+    "Password": null,
+    "AllowTlsResume": true       // leave on: clients may require the data connection
+                                 // to resume the control connection's TLS session
+  }
+}
+```
+
+### Virtual folders
+
+`VirtualFolders` grafts directories onto a tree. `Path` is where the folder appears; `PhysicalPath`
+is the directory it maps to, absolute or relative to the server root.
+
+It can be set in two places. At the top level it applies to **every** session, anonymous ones
+included; on a user it applies to that user alone, on top of the server-wide list. A user entry
+that mounts the same `Path` as a server-wide one replaces it rather than colliding with it — which
+is how one user is given their own `/data`, or a stricter one.
+
+```jsonc
+{
+  "VirtualFolders": [
+    { "Path": "/public", "PhysicalPath": "D:/data/public", "ReadOnly": true }
+  ],
+  "Authentication": {
+    "Users": [
+      { "Name": "alice", "PasswordHash": "...", "VirtualFolders": [
+        { "Path": "/public", "PhysicalPath": "D:/data/public" }   // alice may write to it
+      ] }
+    ]
+  }
+}
+```
+
+Unlike `HomeDirectory`, a virtual folder is **not** confined to the server root — mapping a
+directory from elsewhere on the host is the point of it. Only the mapped subtree is reachable
+through the mount, and links leading out of it are still refused unless `FollowLinks` is on (which
+each folder can override for itself). A `ReadOnly` folder refuses every modifying command with 550,
+whatever the user's own access is, and rename is refused at both ends.
+
+With no `VirtualFolders` anywhere, a session is served exactly as before: the root, or the user's
+home directory, and nothing else.
+
+An authenticator can go further and hand a session a file system of its own — see
+`IFtpFileSystemSource` and the `FtpUser` constructor. That is the extension point for a user store
+that is not the settings file: the source is asked for a fresh `IFileSystem` per login, so it can
+serve an in-memory tree, a composed set of mounts, or a remote store.
+
+### Managing users
+
+The server executable doubles as its own management CLI. Passwords are prompted for, never taken as
+an argument, so they stay out of the shell history and the process list.
+
+```bash
+FtpServer user add alice --home alice
+```
+
+| Command | What it does |
+|---|---|
+| `user add <name> [--home <dir>] [--read-only] [--iterations N]` | Adds an account with a PBKDF2 hash |
+| `user list` | Lists the configured accounts and how each password is stored |
+| `user passwd <name>` | Replaces the password, dropping any weaker stored form |
+| `user remove <name>` | Removes the account |
+| `hash` | Prints a hash to paste in by hand |
+
+All of them take `--config <path>` (default: `appsettings.json` beside the executable) and edit only
+the `Authentication:Users` array, leaving every other setting — including ones this build does not
+know about — untouched. Comments in the file are read, but a save rewrites the document and drops
+them. Running with no command starts the server, so `FtpServer --Port 2121` still works.
+
+### What a running server picks up
+
+The settings files are watched. An account added, changed or removed while the server runs takes
+effect on the **next login** — no restart:
+
+- **Live:** the user list, per-user homes, virtual folders, read-only flags, anonymous access,
+  login throttling, listing limits, and the timeouts a new session reads.
+- **Restart only:** `Port`, `PassivePortRange`, `Certificate` and the hosting front-end. These are
+  bound to sockets that are already open.
+- Sessions that are already logged in keep the tree and access they logged in with.
+
+A saved file that is invalid, or that does not parse at all, is reported in the log and ignored: the
+server keeps running on the last configuration that was valid. At startup the same problem stops the
+server instead, because there is nothing to fall back on.
+
+### Security notes
+
+- **Set `Path`.** It is always mounted as a jail, and a value of `/` is rejected at startup. Every
+  operation is checked against where the path really lands, so a junction or symbolic link inside
+  the tree cannot be used to read or write outside it. `FollowLinks: true` turns that off, for a
+  root deliberately assembled out of links. Neither setting affects hard links, which have no
+  target to refuse to follow — keep the root on a filesystem no untrusted account can write to.
+- **Store passwords as `PasswordHash`.** `Password` and `PasswordSha256` are kept for existing
+  configurations and warn at startup: an unsalted digest can be cracked offline at billions of
+  guesses a second if the configuration ever leaks. `FtpServer user add` always writes the hashed
+  form.
+- **A virtual folder is a hole in the jail, by design.** `PhysicalPath` is not confined to `Path`,
+  so mount only what the user should have, and prefer `ReadOnly` where writes are not needed.
+- **Authentication is required by default.** Set `Authentication.AllowAnonymous` to open the
+  server up, and pair it with `ReadOnly` or `AnonymousCanWrite: false` unless uploads are wanted.
+- **`DataConnection.AllowForeignHost` should stay off.** Turning it on re-enables the RFC 2577
+  bounce attack, where the server can be used to reach hosts and ports the client cannot.
+- **Configure a real certificate** for FTPS. The generated self-signed one changes on every
+  restart and no client can verify it.
+- **Behind NAT, set `DataConnection.PublicAddress`** to the router's public IP and forward the
+  passive port range (plus port 21) to the server. Without it, PASV advertises the private LAN
+  address, which internet clients cannot reach. LAN peers always get the real address, and EPSV
+  is unaffected because its reply never carries an address. The server does not open router
+  ports itself (no UPnP/NAT-PMP) — forwarding must be configured on the router.
 
 ## Usage
-Follow the steps below to run the FTP server:
 
 1. Go to the `src/FtpServer` directory
-2. Replace the settings in `appsettings.json` with your own settings
-3. Run the following command to start the server:
+2. Adjust `appsettings.json`
+3. Run:
    ```bash
    dotnet run
    ```
 
-Currently there is no executable file to download to run the server without the source code. You can publish the project yourself to create an executable file with the following command:
+Publish a self-contained executable:
+
 ```bash
 dotnet publish -c Release -r win-x64
 ```
 
-When given the runtime identifier (`-r`) the server will also be published as AOT (Ahead-Of-Time) compiled executable. When you're trying to cross compile the server, you'll get an error that this isn't supported by .NET. You can publish the server without AOT compilation by adding `-p:PublishAot=false` to the command.
+With a runtime identifier the server is published as a NativeAOT executable. Cross-compiling AOT
+is not supported by .NET; add `-p:PublishAot=false` to publish without it.
+
+## Development
+
+```bash
+dotnet test
+```
+
+The suite covers the parsers and the listing formatter directly, and drives a real server over a
+loopback socket for the protocol-level behaviour.
+
+TLS session resumption cannot be observed through `SslStream`, so it has its own check that uses
+`openssl s_client`:
+
+```bash
+tools/verify-tls-resumption.sh 2500
+```

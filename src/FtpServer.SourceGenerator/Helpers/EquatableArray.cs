@@ -111,15 +111,19 @@ internal readonly struct EquatableArray<T> : IEquatable<EquatableArray<T>>, IEnu
     /// <inheritdoc/>
     public override bool Equals([NotNullWhen(true)] object? obj)
     {
-        return obj is EquatableArray<T> array && Equals(this, array);
+        // Must call the strongly-typed overload. `Equals(this, array)` would bind to the static
+        // object.Equals(object, object), which calls back into this override and recurses forever.
+        return obj is EquatableArray<T> array && Equals(array);
     }
 
     /// <inheritdoc/>
     public override int GetHashCode()
     {
+        // A default instance and an explicitly empty one compare equal (both have an empty span),
+        // so they must hash alike; returning a special value for null would break that.
         if (this.array is not T[] array)
         {
-            return 0;
+            array = [];
         }
 
         HashCode hashCode = default;

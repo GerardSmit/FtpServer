@@ -1,4 +1,4 @@
-﻿using System.Buffers;
+using System.Buffers;
 using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
 using System.Net;
@@ -8,8 +8,24 @@ using Zio;
 
 namespace FtpServer.Extensions;
 
+/// <summary>
+/// Raised when an argument cannot be decoded. Carries the reply the client should get, so it is
+/// answered as a syntax error rather than a server fault.
+/// </summary>
+public sealed class FtpArgumentException(string reply) : Exception(reply)
+{
+    /// <summary>Full FTP reply line, without the trailing CRLF.</summary>
+    public string Reply { get; } = reply;
+}
+
 public static class SequenceExtensions
 {
+    /// <summary>
+    /// Upper bound on a decoded argument. The connection handler already caps the command line,
+    /// so this only guards the conversion helpers against being handed something unbounded.
+    /// </summary>
+    private const int MaxArgumentLength = 8 * 1024;
+
     public static bool SequenceEquals(this ReadOnlySequence<byte> sequence, ReadOnlySpan<byte> value)
     {
         if (sequence.Length != value.Length)
@@ -19,24 +35,101 @@ public static class SequenceExtensions
 
         if (sequence.IsSingleSegment)
         {
-            return sequence.First.Span.SequenceEqual(value);
+            return sequence.FirstSpan.SequenceEqual(value);
         }
 
-        Span<byte> buffer = stackalloc byte[(int)sequence.Length];
-        sequence.CopyTo(buffer);
-        return buffer.SequenceEqual(value);
+        Span<byte> buffer = stackalloc byte[128];
+        byte[]? rented = null;
+
+        if (value.Length > buffer.Length)
+        {
+            rented = ArrayPool<byte>.Shared.Rent(value.Length);
+            buffer = rented;
+        }
+
+        try
+        {
+            var target = buffer[..value.Length];
+            sequence.CopyTo(target);
+            return target.SequenceEqual(value);
+        }
+        finally
+        {
+            if (rented is not null)
+            {
+                ArrayPool<byte>.Shared.Return(rented);
+            }
+        }
+    }
+
+    /// <summary>Case-insensitive ASCII comparison, for keyword arguments such as "UTF8" or "ALL".</summary>
+    public static bool EqualsIgnoreCase(this ReadOnlySequence<byte> sequence, ReadOnlySpan<byte> value)
+    {
+        if (sequence.Length != value.Length || sequence.Length > MaxArgumentLength)
+        {
+            return false;
+        }
+
+        Span<byte> buffer = stackalloc byte[64];
+        byte[]? rented = null;
+
+        if (value.Length > buffer.Length)
+        {
+            rented = ArrayPool<byte>.Shared.Rent(value.Length);
+            buffer = rented;
+        }
+
+        try
+        {
+            var target = buffer[..value.Length];
+            sequence.CopyTo(target);
+
+            for (var i = 0; i < target.Length; i++)
+            {
+                var a = target[i];
+                var b = value[i];
+
+                if (a is >= (byte)'a' and <= (byte)'z')
+                {
+                    a -= 32;
+                }
+
+                if (b is >= (byte)'a' and <= (byte)'z')
+                {
+                    b -= 32;
+                }
+
+                if (a != b)
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+        finally
+        {
+            if (rented is not null)
+            {
+                ArrayPool<byte>.Shared.Return(rented);
+            }
+        }
     }
 
     public static bool TryGetInt32(this ReadOnlySequence<byte> sequence, out int value)
     {
-        if (sequence.IsSingleSegment)
+        value = 0;
+
+        if (sequence.Length is 0 or > 16)
         {
-            return int.TryParse(sequence.First.Span, NumberStyles.None, CultureInfo.InvariantCulture, out value);
+            return false;
         }
 
-        Span<byte> buffer = stackalloc byte[(int)sequence.Length];
-        sequence.CopyTo(buffer);
-        return int.TryParse(buffer, NumberStyles.None, CultureInfo.InvariantCulture, out value);
+        Span<byte> buffer = stackalloc byte[16];
+        var target = buffer[..(int)sequence.Length];
+        sequence.CopyTo(target);
+
+        return int.TryParse(target, NumberStyles.None, CultureInfo.InvariantCulture, out value);
     }
 
     public static bool TryGetInt32(this ReadOnlySequence<byte> sequence, int min, int max, out int value)
@@ -49,241 +142,487 @@ public static class SequenceExtensions
         return value >= min && value <= max;
     }
 
-    public static UPath GetUPath(this ReadOnlySequence<byte> sequence, UPath root, Encoding encoding)
+    public static bool TryGetInt64(this ReadOnlySequence<byte> sequence, out long value)
     {
-        scoped ReadOnlySpan<byte> buffer;
+        value = 0;
 
-        if (sequence.IsSingleSegment)
+        if (sequence.Length is 0 or > 24)
         {
-            buffer = sequence.First.Span;
-        }
-        else
-        {
-            Span<byte> temp = stackalloc byte[(int)sequence.Length];
-            sequence.CopyTo(temp);
-            buffer = temp;
-        }
-
-        return ToUPath(buffer, root, encoding);
-    }
-
-    public static UPath ToUPath(this in ReadOnlySpan<byte> buffer, UPath root, Encoding encoding)
-    {
-        if (buffer.Length == 0)
-        {
-            return root;
-        }
-
-        var span = buffer[0] == '"' && buffer[^1] == '"'
-            ? buffer.Slice(1, buffer.Length - 2)
-            : buffer;
-
-        if (span[0] == '/')
-        {
-            return new UPath(encoding.GetString(span));
-        }
-
-        var length = root.FullName.Length + span.Length + (root == UPath.Root ? 0 : 1);
-        var path = string.Create(length, new Context(span, root, encoding), static (span, state) =>
-        {
-            var root = state.Root;
-            int index;
-
-            if (root != UPath.Root)
-            {
-                root.FullName.AsSpan().CopyTo(span);
-                index = root.FullName.Length;
-            }
-            else
-            {
-                index = 0;
-            }
-
-            span[index] = '/';
-            state.Encoding.GetChars(state.Buffer, span.Slice(index + 1));
-        });
-
-        return new UPath(path);
-    }
-
-#pragma warning disable CS8500
-#pragma warning disable CS9113
-    private readonly unsafe struct Context(ReadOnlySpan<byte> buffer, UPath root, Encoding encoding)
-    {
-        private readonly nint _buffer = (nint)(&buffer);
-
-        public UPath Root { get; } = root;
-
-        public Encoding Encoding { get; } = encoding;
-
-        public ReadOnlySpan<byte> Buffer => *(ReadOnlySpan<byte>*)_buffer;
-    }
-#pragma warning restore CS9113
-#pragma warning restore CS8500
-
-    public static bool TryGetDataPort(this ReadOnlySequence<byte> data, [NotNullWhen(true)] out IPEndPoint? result)
-    {
-        var reader = new SequenceReader<byte>(data);
-
-        if (!GetValue(ref reader, out var ip1) ||
-            !GetValue(ref reader, out var ip2) ||
-            !GetValue(ref reader, out var ip3) ||
-            !GetValue(ref reader, out var ip4) ||
-            !GetValue(ref reader, out var port1) ||
-            !reader.UnreadSequence.TryGetInt32(min: 0, max: 255, out var port2))
-        {
-            result = default;
             return false;
         }
 
-        ReadOnlySpan<byte> ipBytes = [(byte)ip1, (byte)ip2, (byte)ip3, (byte)ip4];
-        var ip = new IPAddress(ipBytes);
-        var port = (port1 << 8) + port2;
+        Span<byte> buffer = stackalloc byte[24];
+        var target = buffer[..(int)sequence.Length];
+        sequence.CopyTo(target);
 
-        result = new IPEndPoint(ip, port);
-        return true;
+        return long.TryParse(target, NumberStyles.None, CultureInfo.InvariantCulture, out value);
+    }
 
-        static bool GetValue(ref SequenceReader<byte> reader, out int result)
+    /// <summary>Decodes an argument to a string.</summary>
+    /// <remarks>
+    /// An argument longer than <see cref="MaxArgumentLength"/> is refused rather than truncated,
+    /// which would turn a pathname or password into a shorter value the client never sent.
+    /// Invalid bytes are refused too: RFC 2640 section 3.1 requires a pathname to be checked for
+    /// validity, and replacement would map every malformed sequence onto one name.
+    /// </remarks>
+    /// <exception cref="FtpArgumentException">The argument is too long or not valid text.</exception>
+    public static string GetString(this ReadOnlySequence<byte> sequence, Encoding encoding)
+    {
+        if (sequence.IsEmpty)
         {
-            if (!reader.TryReadTo(out ReadOnlySequence<byte> sequence, (byte)','))
+            return string.Empty;
+        }
+
+        if (sequence.Length > MaxArgumentLength)
+        {
+            throw new FtpArgumentException("501 Syntax error: argument too long.");
+        }
+
+        var length = (int)sequence.Length;
+        var rented = ArrayPool<byte>.Shared.Rent(length);
+
+        try
+        {
+            var target = rented.AsSpan(0, length);
+            sequence.CopyTo(target);
+
+            // RFC 2640 section 3.1: an embedded CR travels as CR NUL, the NUL being a wire escape.
+            length = StripCrNul(target);
+
+            try
             {
-                result = 0;
+                return encoding.GetString(target[..length]);
+            }
+            catch (DecoderFallbackException)
+            {
+                throw new FtpArgumentException("501 Syntax error: argument is not valid text.");
+            }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(rented);
+        }
+    }
+
+    /// <summary>Collapses each CR NUL pair to the bare CR it encodes, in place.</summary>
+    private static int StripCrNul(Span<byte> buffer)
+    {
+        var index = buffer.IndexOf((byte)'\r');
+
+        if (index < 0 || index + 1 >= buffer.Length)
+        {
+            return buffer.Length;
+        }
+
+        var destination = index;
+
+        for (var source = index; source < buffer.Length; source++)
+        {
+            buffer[destination++] = buffer[source];
+
+            if (buffer[source] == (byte)'\r' && source + 1 < buffer.Length && buffer[source + 1] == 0)
+            {
+                source++;
+            }
+        }
+
+        return destination;
+    }
+
+    // ---- path handling ----------------------------------------------------
+
+    /// <summary>
+    /// Resolves a client-supplied pathname against the session's working directory.
+    /// </summary>
+    /// <remarks>
+    /// Normalisation happens here rather than in the file system: "." and ".." are folded away and
+    /// ".." is clamped at the root, whatever the underlying file system would have done.
+    /// </remarks>
+    public static bool TryResolvePath(this ReadOnlySequence<byte> sequence, UPath current, Encoding encoding, out UPath result)
+        => TryResolvePath(sequence.GetString(encoding), current, out result);
+
+    public static bool TryResolvePath(string argument, UPath current, out UPath result)
+    {
+        result = current;
+
+        // FTP clients quote pathnames that contain spaces.
+        if (argument.Length >= 2 && argument[0] == '"' && argument[^1] == '"')
+        {
+            argument = argument[1..^1].Replace("\"\"", "\"");
+        }
+
+        if (argument.Length == 0)
+        {
+            return true;
+        }
+
+        var absolute = argument[0] is '/' or '\\';
+        var segments = new List<string>();
+
+        if (!absolute)
+        {
+            foreach (var segment in current.FullName.Split('/', StringSplitOptions.RemoveEmptyEntries))
+            {
+                segments.Add(segment);
+            }
+        }
+
+        foreach (var raw in argument.Split(['/', '\\'], StringSplitOptions.RemoveEmptyEntries))
+        {
+            if (raw == ".")
+            {
+                continue;
+            }
+
+            if (raw == "..")
+            {
+                // Clamped rather than failed: "CWD .." from / is a no-op on every mainstream
+                // server.
+                if (segments.Count > 0)
+                {
+                    segments.RemoveAt(segments.Count - 1);
+                }
+
+                continue;
+            }
+
+            if (!IsValidSegment(raw))
+            {
                 return false;
             }
 
-            return sequence.TryGetInt32(min: 0, max: 255, out result);
+            segments.Add(raw);
         }
+
+        result = segments.Count == 0 ? UPath.Root : new UPath("/" + string.Join('/', segments));
+        return true;
+    }
+
+    private static bool IsValidSegment(string segment)
+    {
+        if (segment.Length == 0)
+        {
+            return false;
+        }
+
+        // Control characters cannot appear in a listing line without corrupting it, whatever the
+        // host file system allows.
+        foreach (var c in segment)
+        {
+            if (char.IsControl(c))
+            {
+                return false;
+            }
+        }
+
+        if (!OperatingSystem.IsWindows())
+        {
+            // On Unix the characters below are ordinary filename bytes.
+            return true;
+        }
+
+        // Windows strips a trailing dot or space, letting two distinct names address one file.
+        if (segment[^1] is '.' or ' ')
+        {
+            return false;
+        }
+
+        foreach (var c in segment)
+        {
+            // ':' would open an alternate data stream; the rest are simply illegal.
+            if (c is ':' or '*' or '?' or '"' or '<' or '>' or '|')
+            {
+                return false;
+            }
+        }
+
+        return !IsReservedDeviceName(segment);
+    }
+
+    private static bool IsReservedDeviceName(string segment)
+    {
+        var dot = segment.IndexOf('.');
+        var name = dot < 0 ? segment : segment[..dot];
+
+        return name.ToUpperInvariant() switch
+        {
+            "CON" or "PRN" or "AUX" or "NUL" => true,
+            ['C', 'O', 'M', >= '1' and <= '9'] => true,
+            ['L', 'P', 'T', >= '1' and <= '9'] => true,
+            _ => false,
+        };
+    }
+
+    /// <summary>Escapes a pathname for a 257 reply: RFC 959 requires embedded quotes to be doubled.</summary>
+    public static string ToQuotedPath(this UPath path) => path.FullName.Replace("\"", "\"\"");
+
+    // ---- data port arguments ---------------------------------------------
+
+    public static bool TryGetDataPort(this ReadOnlySequence<byte> data, [NotNullWhen(true)] out IPEndPoint? result)
+    {
+        result = null;
+
+        if (data.Length is 0 or > 64)
+        {
+            return false;
+        }
+
+        Span<byte> buffer = stackalloc byte[64];
+        var target = buffer[..(int)data.Length];
+        data.CopyTo(target);
+
+        Span<int> parts = stackalloc int[6];
+        var count = 0;
+
+        foreach (var range in target.Split((byte)','))
+        {
+            if (count == 6)
+            {
+                // More than six fields: not a valid host-port.
+                return false;
+            }
+
+            var field = target[range].Trim((byte)' ');
+
+            if (!int.TryParse(field, NumberStyles.None, CultureInfo.InvariantCulture, out var value) || value is < 0 or > 255)
+            {
+                return false;
+            }
+
+            parts[count++] = value;
+        }
+
+        if (count != 6)
+        {
+            return false;
+        }
+
+        ReadOnlySpan<byte> ipBytes = [(byte)parts[0], (byte)parts[1], (byte)parts[2], (byte)parts[3]];
+        var port = (parts[4] << 8) + parts[5];
+
+        if (port is < 1 or > 65535)
+        {
+            return false;
+        }
+
+        result = new IPEndPoint(new IPAddress(ipBytes), port);
+        return true;
     }
 
     public static bool TryGetIpAddress(this ReadOnlySequence<byte> data, [NotNullWhen(true)] out IPAddress? result)
     {
-        Span<char> buffer = stackalloc char[39];
+        result = null;
 
-        int length;
-
-        if (data.IsSingleSegment)
+        // Longest textual IPv6 address, including a scope id, comfortably fits.
+        if (data.Length is 0 or > 64)
         {
-            length = Encoding.UTF8.GetChars(data.First.Span, buffer);
-        }
-        else
-        {
-            Span<byte> temp = stackalloc byte[(int)data.Length];
-            data.CopyTo(temp);
-            length = Encoding.UTF8.GetChars(temp, buffer);
+            return false;
         }
 
-        if (IPAddress.TryParse(buffer.Slice(0, length), out var ip))
+        Span<byte> buffer = stackalloc byte[64];
+        var target = buffer[..(int)data.Length];
+        data.CopyTo(target);
+
+        Span<char> chars = stackalloc char[64];
+        var length = Encoding.UTF8.GetChars(target, chars);
+
+        if (IPAddress.TryParse(chars[..length], out var ip))
         {
             result = ip;
             return true;
         }
 
-        result = default;
         return false;
     }
 
-    public static bool TryGetXCRC(this ReadOnlySequence<byte> sequence, UPath root, Encoding encoding, out Crc32Request request)
+    /// <summary>
+    /// Parses the RFC 2428 EPRT argument: <c>&lt;d&gt;net-prt&lt;d&gt;net-addr&lt;d&gt;tcp-port&lt;d&gt;</c>.
+    /// </summary>
+    public static bool TryGetExtendedPort(this ReadOnlySequence<byte> sequence, out IPEndPoint? result, out int networkProtocol)
     {
-        scoped ReadOnlySpan<byte> buffer;
+        result = null;
+        networkProtocol = 0;
 
-        if (sequence.IsSingleSegment)
+        if (sequence.Length is < 7 or > 128)
         {
-            buffer = sequence.First.Span;
-        }
-        else
-        {
-            Span<byte> temp = stackalloc byte[(int)sequence.Length];
-            sequence.CopyTo(temp);
-            buffer = temp;
-        }
-
-        var commaIndex = buffer.IndexOf((byte)',');
-
-        if (commaIndex == -1)
-        {
-            // XCRC <File Name>
-            request = new Crc32Request(buffer.ToUPath(root, encoding), default, default);
-            return true;
-        }
-
-        var path = buffer.Slice(0, commaIndex).ToUPath(root, encoding);
-        var range = buffer.Slice(commaIndex + 1);
-
-        commaIndex = range.IndexOf((byte)',');
-
-        if (commaIndex == -1)
-        {
-            // XCRC <File Name>, <EP>
-            if (!int.TryParse(range.Trim((byte)' '), NumberStyles.None, CultureInfo.InvariantCulture, out var end))
-            {
-                request = default;
-                return false;
-            }
-
-            request = new Crc32Request(path, default, end);
-            return true;
-        }
-
-        // XCRC <File Name>, <SP>, <EP>
-        if (!int.TryParse(range.Slice(0, commaIndex).Trim((byte)' '), NumberStyles.None, CultureInfo.InvariantCulture, out var startValue) ||
-            !int.TryParse(range.Slice(commaIndex + 1).Trim((byte)' '), NumberStyles.None, CultureInfo.InvariantCulture, out var endValue))
-        {
-            request = default;
             return false;
         }
 
-        request = new Crc32Request(path, startValue, endValue);
-        return true;
-    }
-
-    public static bool TryGetExtendedPort(this ReadOnlySequence<byte> sequence, [NotNullWhen(true)] out IPEndPoint? result)
-    {
         var reader = new SequenceReader<byte>(sequence);
 
-        if (!reader.TryRead(out var d))
+        if (!reader.TryRead(out var delimiter))
         {
-            result = default;
             return false;
         }
 
-        if (!reader.TryReadTo(out ReadOnlySequence<byte> netPrtSequence, d) ||
-            !netPrtSequence.TryGetInt32(out var netPrt))
+        // RFC 2428 section 2: the delimiter is a printable ASCII character in the range 33..126.
+        if (delimiter is < 33 or > 126)
         {
-            result = default;
             return false;
         }
 
-        if (!reader.TryReadTo(out ReadOnlySequence<byte> netAddrSequence, d) ||
-            !netAddrSequence.TryGetIpAddress(out var ipAddress))
+        if (!reader.TryReadTo(out ReadOnlySequence<byte> protocolSequence, delimiter) ||
+            !protocolSequence.TryGetInt32(out networkProtocol))
         {
-            result = default;
             return false;
         }
 
-        var expectedAddressFamily = netPrt switch
+        if (!reader.TryReadTo(out ReadOnlySequence<byte> addressSequence, delimiter))
+        {
+            return false;
+        }
+
+        if (!reader.TryReadTo(out ReadOnlySequence<byte> portSequence, delimiter))
+        {
+            // The trailing delimiter is mandatory.
+            return false;
+        }
+
+        // Anything after the closing delimiter is not part of the argument.
+        if (reader.Remaining != 0)
+        {
+            return false;
+        }
+
+        var expectedAddressFamily = networkProtocol switch
         {
             1 => AddressFamily.InterNetwork,
             2 => AddressFamily.InterNetworkV6,
-            _ => AddressFamily.Unknown
+            _ => AddressFamily.Unknown,
         };
 
-        if (ipAddress.AddressFamily != expectedAddressFamily)
+        if (expectedAddressFamily == AddressFamily.Unknown)
         {
-            result = default;
+            // Signals the caller to answer 522 with the protocols we do support.
             return false;
         }
 
-
-        if (!reader.TryReadTo(out ReadOnlySequence<byte> portSequence, d) ||
-            !portSequence.TryGetInt32(out var port))
+        if (!addressSequence.TryGetIpAddress(out var ipAddress) || ipAddress.AddressFamily != expectedAddressFamily)
         {
-            result = default;
+            return false;
+        }
+
+        if (!portSequence.TryGetInt32(min: 1, max: 65535, out var port))
+        {
             return false;
         }
 
         result = new IPEndPoint(ipAddress, port);
         return true;
     }
+
+    /// <summary>
+    /// Parses the checksum-command argument: <c>&lt;pathname&gt;[ &lt;start&gt; &lt;end&gt;]</c>, also
+    /// accepting the comma-separated form used by GlobalSCAPE and Serv-U.
+    /// </summary>
+    public static bool TryGetChecksumRequest(this ReadOnlySequence<byte> sequence, UPath root, Encoding encoding, out ChecksumRequest request)
+    {
+        request = default;
+
+        var text = sequence.GetString(encoding);
+
+        if (text.Length == 0)
+        {
+            return false;
+        }
+
+        string pathPart;
+        string? rangePart = null;
+
+        if (text[0] == '"')
+        {
+            // Quoted pathname; the range, if any, follows the closing quote.
+            var end = text.IndexOf('"', 1);
+
+            if (end < 0)
+            {
+                return false;
+            }
+
+            pathPart = text[..(end + 1)];
+            rangePart = text[(end + 1)..].Trim().TrimStart(',').Trim();
+        }
+        else
+        {
+            var comma = text.IndexOf(',');
+
+            if (comma >= 0)
+            {
+                pathPart = text[..comma].Trim();
+                rangePart = text[(comma + 1)..].Trim();
+            }
+            else
+            {
+                // Space-separated form: the range is the trailing one or two numeric fields.
+                var fields = text.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+
+                if (fields.Length >= 2 && long.TryParse(fields[^1], out _))
+                {
+                    var numeric = 1;
+
+                    if (fields.Length >= 3 && long.TryParse(fields[^2], out _))
+                    {
+                        numeric = 2;
+                    }
+
+                    pathPart = string.Join(' ', fields[..^numeric]);
+                    rangePart = string.Join(' ', fields[^numeric..]);
+                }
+                else
+                {
+                    pathPart = text;
+                }
+            }
+        }
+
+        if (!TryResolvePath(pathPart, root, out var path))
+        {
+            return false;
+        }
+
+        long? start = null;
+        long? end2 = null;
+
+        if (!string.IsNullOrWhiteSpace(rangePart))
+        {
+            var fields = rangePart.Split([',', ' '], StringSplitOptions.RemoveEmptyEntries);
+
+            switch (fields.Length)
+            {
+                case 1:
+                    if (!long.TryParse(fields[0], NumberStyles.None, CultureInfo.InvariantCulture, out var only))
+                    {
+                        return false;
+                    }
+
+                    start = 0;
+                    end2 = only;
+                    break;
+
+                case 2:
+                    if (!long.TryParse(fields[0], NumberStyles.None, CultureInfo.InvariantCulture, out var s) ||
+                        !long.TryParse(fields[1], NumberStyles.None, CultureInfo.InvariantCulture, out var e))
+                    {
+                        return false;
+                    }
+
+                    start = s;
+                    end2 = e;
+                    break;
+
+                default:
+                    return false;
+            }
+
+            if (start > end2)
+            {
+                return false;
+            }
+        }
+
+        request = new ChecksumRequest(path, start, end2);
+        return true;
+    }
 }
 
-public record struct Crc32Request(UPath Path, int? Start, int? End);
+public readonly record struct ChecksumRequest(UPath Path, long? Start, long? End);

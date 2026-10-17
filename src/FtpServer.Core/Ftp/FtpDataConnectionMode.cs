@@ -1,5 +1,14 @@
-﻿namespace FtpServer;
+namespace FtpServer;
 
+/// <summary>
+/// Protection level for the data connection, as negotiated by PROT.
+/// </summary>
+/// <remarks>
+/// RFC 4217 section 9 defines only C and P for TLS. S (safe) and E (confidential) exist in
+/// RFC 2228 for other security mechanisms and are answered 521 here, so they have no
+/// representation in this enum: a level the server cannot actually apply must never be
+/// storable, or the data connection ends up protected differently from what the client asked for.
+/// </remarks>
 public enum FtpDataConnectionMode
 {
     /// <summary>
@@ -11,28 +20,10 @@ public enum FtpDataConnectionMode
     Clear,
 
     /// <summary>
-    /// Provides data integrity protection but does not encrypt the data.
-    /// This level ensures that the data has not been tampered with during transit.
-    /// </summary>
-    /// <remarks>
-    /// PROT S
-    /// </remarks>
-    Safe,
-
-    /// <summary>
-    /// Provides encryption for the data to ensure confidentiality but does not include integrity protection.
-    /// </summary>
-    /// <remarks>
-    /// PROT E
-    /// </remarks>
-    Confidential,
-
-    /// <summary>
     /// Provides both encryption and integrity protection for the data connection.
-    /// This is the most secure option, ensuring that data is both encrypted and has not been altered during transit.
     /// </summary>
     /// <remarks>
     /// PROT P
     /// </remarks>
-    Private
+    Private,
 }
