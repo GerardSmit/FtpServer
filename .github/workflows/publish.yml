@@ -1,6 +1,6 @@
 name: Publish
 
-# Releases FtpServer.Core, FtpServer.Sockets and FtpServer.Kestrel to nuget.org.
+# Releases GerardSmit.FtpServer.Core, .Sockets and .Kestrel to nuget.org.
 #
 # Run it from the Actions tab ("Run workflow") and pick the bump: the version is the latest v* tag
 # bumped by that much, the tag is created once the packages are published, and a GitHub release
@@ -140,7 +140,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          for id in FtpServer.Core FtpServer.Sockets FtpServer.Kestrel; do
+          for id in GerardSmit.FtpServer.Core GerardSmit.FtpServer.Sockets GerardSmit.FtpServer.Kestrel; do
             for ext in nupkg snupkg; do
               test -f "artifacts/$id.$VERSION.$ext" || { echo "::error::Missing $id.$VERSION.$ext"; exit 1; }
             done
@@ -168,8 +168,8 @@ jobs:
           </configuration>
           EOF
 
-          dotnet add package FtpServer.Sockets --version "$VERSION"
-          dotnet add package FtpServer.Kestrel --version "$VERSION"
+          dotnet add package GerardSmit.FtpServer.Sockets --version "$VERSION"
+          dotnet add package GerardSmit.FtpServer.Kestrel --version "$VERSION"
 
           cat > Program.cs <<'EOF'
           // Touches a type from each package, so a missing assembly is a compile error.
@@ -255,7 +255,7 @@ jobs:
             echo
             echo
             echo "**NuGet:**"
-            for id in FtpServer.Core FtpServer.Sockets FtpServer.Kestrel; do
+            for id in GerardSmit.FtpServer.Core GerardSmit.FtpServer.Sockets GerardSmit.FtpServer.Kestrel; do
               echo "- [$id $VERSION](https://www.nuget.org/packages/$id/$VERSION)"
             done
           } >> release_notes.md

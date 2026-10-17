@@ -6,7 +6,8 @@
         <RootNamespace>FtpServer</RootNamespace>
         <IsAotCompatible>true</IsAotCompatible>
         <IsPackable>true</IsPackable>
-        <Description>FTP(S) server protocol implementation for .NET: commands, sessions, data connections and the file system jail. Host it with FtpServer.Sockets or FtpServer.Kestrel.</Description>
+        <PackageId>GerardSmit.FtpServer.Core</PackageId>
+        <Description>FTP(S) server protocol implementation for .NET: commands, sessions, data connections and the file system jail. Host it with GerardSmit.FtpServer.Sockets or GerardSmit.FtpServer.Kestrel.</Description>
     </PropertyGroup>
 
     <ItemGroup>

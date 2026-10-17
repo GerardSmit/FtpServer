@@ -5,7 +5,8 @@
         <RootNamespace>FtpServer</RootNamespace>
         <IsAotCompatible>true</IsAotCompatible>
         <IsPackable>true</IsPackable>
-        <Description>Raw-socket hosting for FtpServer.Core, as an IHostedService.</Description>
+        <PackageId>GerardSmit.FtpServer.Sockets</PackageId>
+        <Description>Raw-socket hosting for GerardSmit.FtpServer.Core, as an IHostedService.</Description>
     </PropertyGroup>
 
     <ItemGroup>
