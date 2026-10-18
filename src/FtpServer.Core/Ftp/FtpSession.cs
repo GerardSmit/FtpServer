@@ -78,6 +78,13 @@ public sealed class FtpSession(
     /// </summary>
     public bool IsImplicitTls { get; set; }
 
+    /// <summary>
+    /// The certificate the control connection's TLS handshake presented, reused for this
+    /// session's data connections so a certificate renewed mid-session does not break TLS
+    /// session resumption between the two. Null while the control connection is in the clear.
+    /// </summary>
+    public System.Net.Security.SslStreamCertificateContext? TlsCertificateContext { get; set; }
+
     // ---- login state ------------------------------------------------------
 
     public bool IsAuthenticated { get; private set; }

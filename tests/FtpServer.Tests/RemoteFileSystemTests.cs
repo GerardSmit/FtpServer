@@ -39,6 +39,45 @@ public class RemoteFileSystemTests
     }
 
     [Fact]
+    public async Task An_open_session_keeps_its_certificate_for_data_connections_after_a_replacement()
+    {
+        await using var server = await FtpServerFixture.StartAsync(options => options.Ftps = true);
+        server.WriteFile("data.txt", "protected payload");
+
+        await using var client = await server.ConnectAsync();
+        await client.SendAsync("AUTH TLS");
+        await client.StartTlsAsync();
+        await client.SendAsync("PBSZ 0");
+        await client.SendAsync("PROT P");
+        await client.SendAsync("USER anonymous");
+        await client.SendAsync("PASS a@b.c");
+        await client.SendAsync("TYPE I");
+
+        var replacement = CertificateProvider.CreateSelfSignedCertificate("ftp.example.test", 2048);
+        server.Services.GetRequiredService<CertificateProvider>().Use(new X509Certificate2Collection(replacement));
+
+        // A data connection presenting the new certificate could not resume the control
+        // connection's TLS session, which clients such as FileZilla insist on.
+        using var data = await client.OpenPassiveAsync();
+        await client.SendAsync("RETR data.txt", 0);
+
+        await using var ssl = new System.Net.Security.SslStream(data.GetStream(), false, static (_, _, _, _) => true);
+        await ssl.AuthenticateAsClientAsync(new System.Net.Security.SslClientAuthenticationOptions { TargetHost = "localhost" });
+
+        using var buffer = new MemoryStream();
+        await ssl.CopyToAsync(buffer).WaitAsync(TimeSpan.FromSeconds(30));
+
+        Assert.Contains("CN=localhost", ssl.RemoteCertificate!.Subject, StringComparison.Ordinal);
+        Assert.Equal("protected payload", Encoding.ASCII.GetString(buffer.ToArray()));
+
+        // A new session gets the replacement.
+        await using var fresh = await server.ConnectAsync();
+        await fresh.SendAsync("AUTH TLS");
+        await fresh.StartTlsAsync();
+        Assert.Contains("CN=ftp.example.test", fresh.RemoteCertificate!.Subject, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void A_certificate_without_a_private_key_is_refused()
     {
         using var withKey = CertificateProvider.CreateSelfSignedCertificate("ftp.example.test", 2048);

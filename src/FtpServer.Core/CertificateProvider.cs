@@ -146,9 +146,18 @@ public sealed class CertificateProvider(
         Log.UsingCertificate(logger, leaf.Subject, leaf.Thumbprint);
     }
 
-    public SslServerAuthenticationOptions CreateServerAuthenticationOptions() => new()
+    public SslServerAuthenticationOptions CreateServerAuthenticationOptions() =>
+        CreateServerAuthenticationOptions(GetCertificateContext());
+
+    /// <summary>
+    /// Options that present <paramref name="certificateContext"/>: for the data connections of a
+    /// session, which must keep the certificate its control connection was handshaken with even
+    /// after <see cref="Use"/> has replaced it - a client that requires the data connection to
+    /// resume the control connection's TLS session cannot resume it under another certificate.
+    /// </summary>
+    public SslServerAuthenticationOptions CreateServerAuthenticationOptions(SslStreamCertificateContext certificateContext) => new()
     {
-        ServerCertificateContext = GetCertificateContext(),
+        ServerCertificateContext = certificateContext,
         EnabledSslProtocols = ResolveProtocols(),
         ClientCertificateRequired = false,
         AllowTlsResume = options.Value.Certificate.AllowTlsResume,

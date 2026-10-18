@@ -313,6 +313,7 @@ public partial class FtpConnectionHandler(
 
                     session.Transport = pipe;
                     session.IsProtected = false;
+                    session.TlsCertificateContext = null;
                     input = pipe.Input;
                     continue;
                 }
@@ -607,7 +608,12 @@ public partial class FtpConnectionHandler(
                 (_, clientHello, _, _) =>
                 {
                     session.TlsServerName = string.IsNullOrEmpty(clientHello.ServerName) ? null : clientHello.ServerName;
-                    return ValueTask.FromResult(provider.CreateServerAuthenticationOptions());
+
+                    // Remembered for the data connections, which present the same certificate
+                    // even if it is replaced while this session is open.
+                    var tlsOptions = provider.CreateServerAuthenticationOptions();
+                    session.TlsCertificateContext = tlsOptions.ServerCertificateContext;
+                    return ValueTask.FromResult(tlsOptions);
                 },
                 state: null,
                 timeout.Token);

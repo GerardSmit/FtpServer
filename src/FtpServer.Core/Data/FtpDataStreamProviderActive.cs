@@ -95,9 +95,13 @@ internal static class DataConnectionTls
             using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token);
             timeout.CancelAfter(options.Connection.TlsHandshakeTimeout);
 
-            await sslStream.AuthenticateAsServerAsync(
-                certificateProvider.CreateServerAuthenticationOptions(),
-                timeout.Token);
+            // The control connection's certificate, so a renewal mid-session cannot stop the data
+            // connection resuming its TLS session.
+            var tlsOptions = session.TlsCertificateContext is { } certificateContext
+                ? certificateProvider.CreateServerAuthenticationOptions(certificateContext)
+                : certificateProvider.CreateServerAuthenticationOptions();
+
+            await sslStream.AuthenticateAsServerAsync(tlsOptions, timeout.Token);
         }
         catch (Exception ex)
         {
