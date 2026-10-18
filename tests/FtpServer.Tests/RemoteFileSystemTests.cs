@@ -163,10 +163,64 @@ public class RemoteFileSystemTests
         Assert.Equal(0, fileSystem.InternalPathRequests);
     }
 
-    private static Task<FtpServerFixture> StartAsync(RemoteMemoryFileSystem fileSystem) =>
+    [Fact]
+    public async Task Mff_refuses_the_unix_mode_of_a_remote_tree_and_feat_does_not_offer_it()
+    {
+        var fileSystem = new RemoteMemoryFileSystem();
+        await using var server = await StartAsync(fileSystem);
+        await using var client = await LoginAsync(server);
+
+        var mff = (await client.SendAsync("FEAT")).Split("\r\n").Single(line => line.StartsWith(" MFF ", StringComparison.Ordinal));
+        Assert.DoesNotContain("UNIX.mode", mff, StringComparison.Ordinal);
+        Assert.StartsWith("504", await client.SendAsync("MFF modify=20200102030405;UNIX.mode=0644; /file.txt"));
+
+        // All or nothing: the modify fact was not applied either.
+        Assert.NotEqual(2020, fileSystem.GetLastWriteTime("/file.txt").Year);
+        Assert.Equal(0, fileSystem.InternalPathRequests);
+    }
+
+    [Fact]
+    public async Task A_remote_tree_mounted_inside_a_local_one_is_found_per_path()
+    {
+        var fileSystem = new RemoteMemoryFileSystem();
+        await using var server = await StartAsync(fileSystem, mounted: true);
+        await using var client = await LoginAsync(server);
+
+        // The provider gets the path inside itself, not the one the client named.
+        Assert.Equal("250 DEADBEEF\r\n", await client.SendAsync("XCRC /remote/file.txt"));
+        Assert.Equal(("/file.txt", "CRC32", 0L, 5L), fileSystem.LastChecksum);
+        Assert.Equal("213 12345\r\n", await client.SendAsync("AVBL /remote"));
+
+        var (_, control) = await client.DownloadAsync("MLSD /remote");
+        Assert.Contains("226", control);
+        Assert.DoesNotMatch("^2", await client.SendAsync("SITE SYMLINK /remote/file.txt /remote/link.txt"));
+        Assert.StartsWith("504", await client.SendAsync("MFF UNIX.mode=0644; /remote/file.txt"));
+        Assert.Equal(0, fileSystem.InternalPathRequests);
+    }
+
+    [Fact]
+    public async Task Paths_a_file_system_reports_read_only_are_refused_up_front_and_listed_without_write()
+    {
+        var fileSystem = new RemoteMemoryFileSystem { ReadOnlyDirectory = "/locked" };
+        await using var server = await StartAsync(fileSystem, mounted: true);
+        await using var client = await LoginAsync(server);
+
+        // Refused before a data connection is asked for, not after a 150.
+        Assert.StartsWith("550", await client.SendAsync("STOR /remote/locked/new.txt"));
+        Assert.StartsWith("550", await client.SendAsync("DELE /remote/locked/file.txt"));
+        Assert.True(fileSystem.FileExists("/locked/file.txt"));
+
+        var (locked, _) = await client.DownloadAsync("MLSD /remote/locked");
+        var (open, _) = await client.DownloadAsync("MLSD /remote");
+
+        Assert.Matches(@"perm=r;[^\r\n]* file\.txt", Encoding.UTF8.GetString(locked));
+        Assert.Matches(@"perm=rawdf;[^\r\n]* file\.txt", Encoding.UTF8.GetString(open));
+    }
+
+    private static Task<FtpServerFixture> StartAsync(RemoteMemoryFileSystem fileSystem, bool mounted = false) =>
         FtpServerFixture.StartAsync(
             o => o.Authentication.AllowAnonymous = false,
-            services => services.AddSingleton<IFtpAuthenticator>(new RemoteAuthenticator(fileSystem)));
+            services => services.AddSingleton<IFtpAuthenticator>(new RemoteAuthenticator(fileSystem, mounted)));
 
     private static async Task<FtpTestClient> LoginAsync(FtpServerFixture server)
     {
@@ -176,7 +230,7 @@ public class RemoteFileSystemTests
         return client;
     }
 
-    private sealed class RemoteAuthenticator(RemoteMemoryFileSystem fileSystem) : IFtpAuthenticator, IFtpFileSystemSource
+    private sealed class RemoteAuthenticator(RemoteMemoryFileSystem fileSystem, bool mounted) : IFtpAuthenticator, IFtpFileSystemSource
     {
         public ValueTask<FtpAuthenticationResult> AuthenticateUserAsync(string userName, System.Net.EndPoint? remoteEndPoint, CancellationToken token) =>
             new(FtpAuthenticationResult.PasswordRequired);
@@ -185,10 +239,21 @@ public class RemoteFileSystemTests
             new(FtpAuthenticationResult.Success(new FtpUser("remote", isAnonymous: false, isReadOnly: false, homeDirectory: null, this)));
 
         // The session disposes what it is given; the test keeps observing the same instance.
-        public IFileSystem Create() => new NonDisposingFileSystem(fileSystem);
+        public IFileSystem Create()
+        {
+            if (!mounted)
+            {
+                return new NonDisposingFileSystem(fileSystem);
+            }
+
+            var mounts = new MountFileSystem(new MemoryFileSystem(), owned: false);
+            mounts.Mount("/remote", fileSystem);
+            return mounts;
+        }
     }
 
-    private sealed class NonDisposingFileSystem(RemoteMemoryFileSystem inner) : ComposeFileSystem(inner, owned: false), IFtpRemoteFileSystem
+    private sealed class NonDisposingFileSystem(RemoteMemoryFileSystem inner)
+        : ComposeFileSystem(inner, owned: false), IFtpRemoteFileSystem, IFtpChecksumProvider, IFtpAvailableSpaceProvider
     {
         protected override UPath ConvertPathToDelegate(UPath path) => path;
 
@@ -203,12 +268,17 @@ public class RemoteFileSystemTests
             inner.GetAvailableSpaceAsync(path, token);
     }
 
-    private sealed class RemoteMemoryFileSystem : MemoryFileSystem, IFtpRemoteFileSystem
+    private sealed class RemoteMemoryFileSystem
+        : MemoryFileSystem, IFtpRemoteFileSystem, IFtpChecksumProvider, IFtpAvailableSpaceProvider, IFtpReadOnlyPaths
     {
         public RemoteMemoryFileSystem()
         {
             this.WriteAllText("/file.txt", "hello");
+            CreateDirectory("/locked");
+            this.WriteAllText("/locked/file.txt", "kept");
         }
+
+        public UPath? ReadOnlyDirectory { get; init; }
 
         public string? Digest { get; init; } = "DEADBEEF";
 
@@ -229,5 +299,8 @@ public class RemoteFileSystemTests
         }
 
         public ValueTask<long?> GetAvailableSpaceAsync(UPath path, CancellationToken token) => new(12345L);
+
+        public bool IsReadOnly(UPath path) =>
+            ReadOnlyDirectory is { } directory && (path == directory || path.IsInDirectory(directory, recursive: true));
     }
 }

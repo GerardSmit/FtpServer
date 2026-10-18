@@ -143,6 +143,10 @@ public class VirtualFolderTests
 
             Assert.True(File.Exists(Path.Combine(external, "note.txt")));
 
+            // Listings say so too, rather than advertising writes that are then refused.
+            var (archive, _) = await client.DownloadAsync("MLSD /archive");
+            Assert.Matches(@"perm=[^;w]*;[^\r\n]* note\.txt", Encoding.UTF8.GetString(archive));
+
             // The same session can still write outside the mount.
             Assert.Contains("226", await client.UploadAsync("STOR /own.txt", "mine"u8.ToArray()));
         }

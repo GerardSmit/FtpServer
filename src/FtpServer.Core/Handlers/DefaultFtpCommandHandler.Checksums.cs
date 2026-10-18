@@ -137,10 +137,11 @@ public partial class DefaultFtpCommandHandler
 
         try
         {
-            // A remote tree digests the file where it is, rather than streaming it here first.
-            digest = session.FileSystem is IFtpRemoteFileSystem remote &&
-                     await remote.ComputeChecksumAsync(request.Path, algorithm, start, end, token) is { } remoteDigest
-                ? remoteDigest.ToLowerInvariant()
+            // A tree that digests files itself - where they are, or from a digest it already
+            // knows - saves streaming the whole file here first.
+            digest = FtpFileSystemCapabilities.TryResolve<IFtpChecksumProvider>(session.FileSystem, request.Path, out var provider, out var providerPath) &&
+                     await provider.ComputeChecksumAsync(providerPath, algorithm, start, end, token) is { } providedDigest
+                ? providedDigest.ToLowerInvariant()
                 : await ComputeAsync(session, request.Path, algorithm, start, end, token);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
@@ -255,9 +256,15 @@ public partial class DefaultFtpCommandHandler
             return session.WriteAsync("550 Directory not found.\r\n"u8, token);
         }
 
-        if (session.FileSystem is IFtpRemoteFileSystem remote)
+        if (FtpFileSystemCapabilities.TryResolve<IFtpAvailableSpaceProvider>(session.FileSystem, path, out var provider, out var providerPath))
         {
-            return GetRemoteAvailableSpaceAsync(session, remote, path, token);
+            return GetProvidedAvailableSpaceAsync(session, provider, providerPath, token);
+        }
+
+        // A remote tree that cannot say has no volume here to ask either.
+        if (!FtpFileSystemCapabilities.HasHostPath(session.FileSystem, path))
+        {
+            return session.WriteAsync("550 Requested action not taken.\r\n"u8, token);
         }
 
         try
@@ -272,13 +279,13 @@ public partial class DefaultFtpCommandHandler
         }
     }
 
-    private static async ValueTask GetRemoteAvailableSpaceAsync(FtpSession session, IFtpRemoteFileSystem remote, UPath path, CancellationToken token)
+    private static async ValueTask GetProvidedAvailableSpaceAsync(FtpSession session, IFtpAvailableSpaceProvider provider, UPath path, CancellationToken token)
     {
         long? available;
 
         try
         {
-            available = await remote.GetAvailableSpaceAsync(path, token);
+            available = await provider.GetAvailableSpaceAsync(path, token);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
@@ -366,11 +373,11 @@ public partial class DefaultFtpCommandHandler
 
 internal static class HashAlgorithms
 {
-    public const string Crc32 = "CRC32";
-    public const string Md5 = "MD5";
-    public const string Sha1 = "SHA-1";
-    public const string Sha256 = "SHA-256";
-    public const string Sha512 = "SHA-512";
+    public const string Crc32 = FtpChecksumAlgorithm.Crc32;
+    public const string Md5 = FtpChecksumAlgorithm.Md5;
+    public const string Sha1 = FtpChecksumAlgorithm.Sha1;
+    public const string Sha256 = FtpChecksumAlgorithm.Sha256;
+    public const string Sha512 = FtpChecksumAlgorithm.Sha512;
 
     public static readonly string[] Supported = [Sha256, Sha512, Sha1, Md5, Crc32];
 

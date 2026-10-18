@@ -891,6 +891,7 @@ public partial class DefaultFtpCommandHandler
         DateTimeOffset? modify = null;
         DateTimeOffset? create = null;
         int? mode = null;
+        string? modeFact = null;
         var applied = new List<string>();
 
         foreach (var fact in text[..space].Split(';', StringSplitOptions.RemoveEmptyEntries))
@@ -937,6 +938,7 @@ public partial class DefaultFtpCommandHandler
                     }
 
                     mode = bits;
+                    modeFact = name;
                     applied.Add(name + "=" + value);
                     break;
 
@@ -955,6 +957,13 @@ public partial class DefaultFtpCommandHandler
             return reply;
         }
 
+        // A remote tree has no host path to set the mode on. Refused before anything is applied,
+        // because MFF is all or nothing.
+        if (modeFact is not null && !FtpFileSystemCapabilities.HasHostPath(session.FileSystem, path))
+        {
+            return session.WriteAsync("504 Fact "u8, modeFact, " cannot be modified.\r\n"u8, token);
+        }
+
         try
         {
             if (modify is { } m)
@@ -967,8 +976,7 @@ public partial class DefaultFtpCommandHandler
                 session.FileSystem.SetCreationTime(path, c.UtcDateTime);
             }
 
-            // A remote tree has no host path to set the mode on; the mode is left as it is, as on Windows.
-            if (mode is { } unixMode && !OperatingSystem.IsWindows() && session.FileSystem is not IFtpRemoteFileSystem)
+            if (mode is { } unixMode && !OperatingSystem.IsWindows())
             {
                 File.SetUnixFileMode(session.FileSystem.ConvertPathToInternal(path), (UnixFileMode)unixMode);
             }
@@ -981,9 +989,14 @@ public partial class DefaultFtpCommandHandler
         return session.WriteAsync("213 "u8, string.Join(';', applied) + "; " + path.FullName, "\r\n"u8, token);
     }
 
-    /// <summary>The MFF facts this host can change, as FEAT lists them.</summary>
-    internal static string ModifiableFacts =>
-        "modify;" + (CanSetCreationTime ? "create;" : string.Empty) + (CanSetUnixMode ? "UNIX.mode;" : string.Empty);
+    /// <summary>
+    /// The MFF facts this host can change in the session's tree, as FEAT lists them. A remote
+    /// tree has no mode bits to change.
+    /// </summary>
+    internal static string ModifiableFacts(FtpSession session) =>
+        "modify;" +
+        (CanSetCreationTime ? "create;" : string.Empty) +
+        (CanSetUnixMode && FtpFileSystemCapabilities.HasHostPath(session.FileSystem, UPath.Root) ? "UNIX.mode;" : string.Empty);
 }
 
 /// <summary>

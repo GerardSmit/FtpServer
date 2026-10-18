@@ -72,7 +72,7 @@ public partial class DefaultFtpCommandHandler
             lines.Add(" MFCT");
         }
 
-        lines.Add(" MFF " + ModifiableFacts);
+        lines.Add(" MFF " + ModifiableFacts(session));
 
         if (features.ModeZ)
         {
@@ -592,7 +592,7 @@ public partial class DefaultFtpCommandHandler
         }
 
         // A remote tree has no host path to chmod, which is the same as having no mode bits.
-        if (OperatingSystem.IsWindows() || session.FileSystem is IFtpRemoteFileSystem)
+        if (OperatingSystem.IsWindows() || !FtpFileSystemCapabilities.HasHostPath(session.FileSystem, path))
         {
             // Windows has no Unix mode bits. The default is a 200 that says the mode was ignored,
             // because clients that copy permissions on upload otherwise fail every transfer; an
@@ -802,7 +802,7 @@ public partial class DefaultFtpCommandHandler
         var fileSystem = session.FileSystem;
 
         // A link is made on the host, and a remote tree has no host path to make it at.
-        if (fileSystem is IFtpRemoteFileSystem)
+        if (!FtpFileSystemCapabilities.HasHostPath(fileSystem, link) || !FtpFileSystemCapabilities.HasHostPath(fileSystem, target))
         {
             return session.WriteAsync("550 Requested action not taken: links cannot be created here.\r\n"u8, token);
         }

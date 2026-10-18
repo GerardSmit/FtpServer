@@ -273,7 +273,7 @@ public partial class DefaultFtpCommandHandler
                     break;
 
                 case ListingFormat.Machine:
-                    listingFormatter.AppendMachineListing(target, session.FileSystem, item, session.CanWrite, session.EnabledFacts);
+                    listingFormatter.AppendMachineListing(target, session.FileSystem, item, session.CanWriteTo(item.Path), session.EnabledFacts);
                     break;
 
                 default:
@@ -287,7 +287,7 @@ public partial class DefaultFtpCommandHandler
     {
         try
         {
-            listingFormatter.AppendMachineListing(builder, session.FileSystem, ToItem(session, path, isDirectory: true), session.CanWrite, session.EnabledFacts, type);
+            listingFormatter.AppendMachineListing(builder, session.FileSystem, ToItem(session, path, isDirectory: true), session.CanWriteTo(path), session.EnabledFacts, type);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
@@ -405,7 +405,7 @@ public partial class DefaultFtpCommandHandler
             builder,
             session.FileSystem,
             ToItem(session, path, isDirectory),
-            session.CanWrite,
+            session.CanWriteTo(path),
             session.EnabledFacts,
             nameOverride: path.FullName);
 

@@ -218,7 +218,7 @@ public sealed class FtpListingFormatter(PermissionProvider permissionProvider)
     {
         // No host path to read an ACL or mode from: the attributes the enumeration returned are
         // all there is, and asking for the path would throw once per entry.
-        if (fileSystem is IFtpRemoteFileSystem)
+        if (!FtpFileSystemCapabilities.HasHostPath(fileSystem, item.Path))
         {
             return GetRemotePermissions(item);
         }

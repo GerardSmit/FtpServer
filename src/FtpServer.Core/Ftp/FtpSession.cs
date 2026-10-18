@@ -4,9 +4,9 @@ using System.Net;
 using System.Text;
 using FtpServer.Authentication;
 using FtpServer.Data;
+using FtpServer.IO;
 using FtpServer.Utils;
 using Zio;
-using Zio.FileSystems;
 
 namespace FtpServer;
 
@@ -181,20 +181,15 @@ public sealed class FtpSession(
 
     /// <summary>
     /// Whether <paramref name="path"/> may be modified: the session has to be writable, and the
-    /// path must not fall inside a folder that was mounted read-only.
+    /// path must not fall inside a folder that was mounted read-only, or one whose file system
+    /// reports it read-only through <see cref="IFtpReadOnlyPaths"/>.
     /// </summary>
     /// <remarks>
     /// Asked before a command acts, so a read-only mount is refused with 550 rather than failing
     /// once the data connection is already open - which is the illegal "150 then error" sequence
     /// the transfer code takes care to avoid everywhere else.
     /// </remarks>
-    public bool CanWriteTo(UPath path) => CanWrite && !IsReadOnlyMount(FileSystem, path);
-
-    private static bool IsReadOnlyMount(IFileSystem fileSystem, UPath path) =>
-        fileSystem is MountFileSystem mounts &&
-        path.IsAbsolute &&
-        mounts.TryGetMount(path, out _, out var target, out _) &&
-        target is ReadOnlyFileSystem;
+    public bool CanWriteTo(UPath path) => CanWrite && !FtpFileSystemCapabilities.IsReadOnly(FileSystem, path);
 
     public void ReplaceFileSystem(IFileSystem newFileSystem)
     {
