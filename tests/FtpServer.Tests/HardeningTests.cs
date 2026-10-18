@@ -247,8 +247,30 @@ public class HardeningTests
 
         protected override void OnServerFaulted(Exception exception) => Interlocked.Increment(ref _faults);
 
-        protected override async Task OnClientConnectedAsync(FtpSession session, CancellationToken token) =>
+        protected override async Task OnClientConnectedAsync(FtpSession session, CancellationToken token)
+        {
             await session.WriteAsync("220 ok\r\n", token);
+
+            // Returning disposes the connection, which can drop the reply before it has left the
+            // send pipe; held until the client hangs up (or the listener stops), as the real
+            // handler lingers.
+            try
+            {
+                while (true)
+                {
+                    var result = await session.Transport.Input.ReadAsync(token);
+                    session.Transport.Input.AdvanceTo(result.Buffer.End);
+
+                    if (result.IsCompleted)
+                    {
+                        break;
+                    }
+                }
+            }
+            catch (OperationCanceledException)
+            {
+            }
+        }
     }
 
     // ---- login throttling -------------------------------------------------
