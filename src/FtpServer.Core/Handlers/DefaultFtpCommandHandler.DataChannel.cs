@@ -299,6 +299,10 @@ public partial class DefaultFtpCommandHandler
         // this command produces exactly one reply.
         session.DataStreamProvider = new FtpDataStreamProviderPassive(owner, session.RemoteEndPoint);
 
+        // The client has this long, from the reply on, to connect and start a transfer; after that
+        // the port is free for somebody else.
+        owner.ExpireAfter(options.Current.DataConnection.Timeout);
+
         switch (kind)
         {
             case PassiveReplyKind.Extended:

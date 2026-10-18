@@ -44,12 +44,23 @@ public static class FtpOptionsValidator
             return false;
         }
 
-        if (options.Connection.IdleTimeout < TimeSpan.Zero ||
+        // Zero would not mean "off": a deadline that has already passed refuses everything, and
+        // an inactivity limit of zero abandons every transfer at its first read.
+        if (options.Connection.IdleTimeout <= TimeSpan.Zero ||
+            options.Connection.LoginTimeout <= TimeSpan.Zero ||
+            options.Connection.WriteTimeout <= TimeSpan.Zero ||
             options.Connection.TlsHandshakeTimeout <= TimeSpan.Zero ||
             options.DataConnection.Timeout <= TimeSpan.Zero ||
+            options.DataConnection.InactivityTimeout <= TimeSpan.Zero ||
             options.DataConnection.ConnectTimeout <= TimeSpan.Zero)
         {
-            error = "Timeouts must be positive.";
+            error = "Timeouts must be greater than zero.";
+            return false;
+        }
+
+        if (options.DataConnection.MaxUploadSize is < 0)
+        {
+            error = "DataConnection.MaxUploadSize must not be negative.";
             return false;
         }
 

@@ -163,29 +163,77 @@ public abstract class FtpListener(FtpSessionProvider sessionProvider, FtpConnect
             throw new InvalidOperationException("Not listening");
         }
 
-        try
-        {
-            while (!_shutdown.IsCancellationRequested)
-            {
-                var clientSocket = await listener.AcceptAsync(_shutdown.Token).ConfigureAwait(false);
+        var backoff = AcceptBackoffStart;
 
-                SocketConnection.SetRecommendedServerOptions(clientSocket);
+        while (!_shutdown.IsCancellationRequested)
+        {
+            try
+            {
+                var clientSocket = await AcceptAsync(listener, _shutdown.Token).ConfigureAwait(false);
+
+                backoff = AcceptBackoffStart;
+
+                try
+                {
+                    SocketConnection.SetRecommendedServerOptions(clientSocket);
+                }
+                catch
+                {
+                    // The peer may already have gone; the socket must not outlive the failure.
+                    try { clientSocket.Dispose(); } catch { /* already closed */ }
+                    throw;
+                }
 
                 // Each client runs independently; a fault in one must not stop the accept loop.
                 Track(Task.Run(() => RunClientAsync(clientSocket, sendOptions, receiveOptions)));
             }
-        }
-        catch (OperationCanceledException)
-        {
-        }
-        catch (ObjectDisposedException)
-        {
-        }
-        catch (Exception ex)
-        {
-            OnServerFaulted(ex);
+            catch (ObjectDisposedException) when (_shutdown.IsCancellationRequested || !ReferenceEquals(_listener, listener))
+            {
+                // The listening socket was closed by a stop.
+                return;
+            }
+            catch (Exception) when (_shutdown.IsCancellationRequested)
+            {
+                // Closing the listening socket makes the pending accept fail with a socket error.
+                return;
+            }
+            catch (Exception ex)
+            {
+                // A reset peer in the backlog, descriptor exhaustion or a full buffer pool says
+                // nothing that stops the next accept from working. Giving up here would leave a
+                // server that is running but deaf, which one bad connection could cause.
+                OnServerFaulted(ex);
+
+                // Without a pause, a fault that repeats instantly spins a core and floods the log.
+                try
+                {
+                    await Task.Delay(backoff, _shutdown.Token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    return;
+                }
+
+                backoff = TimeSpan.FromTicks(Math.Min(backoff.Ticks * 2, AcceptBackoffMax.Ticks));
+            }
         }
     }
+
+    /// <summary>Accepts one connection; a seam for tests to make the accept itself fail.</summary>
+    internal virtual ValueTask<Socket> AcceptAsync(Socket listener, CancellationToken token) =>
+        listener.AcceptAsync(token);
+
+    private static readonly TimeSpan AcceptBackoffStart = TimeSpan.FromMilliseconds(100);
+    private static readonly TimeSpan AcceptBackoffMax = TimeSpan.FromSeconds(1);
+
+    /// <summary>
+    /// Most refusals being answered at once. Each holds a socket for up to a couple of seconds
+    /// while the client reads the 421, so without a cap a flood of connections over the limit
+    /// turns the courtesy into the very exhaustion it was meant to prevent.
+    /// </summary>
+    private const int MaxConcurrentRefusals = 32;
+
+    private int _refusals;
 
     /// <summary>Registers a client task, and unregisters it when it finishes.</summary>
     private void Track(Task client)
@@ -218,16 +266,31 @@ public abstract class FtpListener(FtpSessionProvider sessionProvider, FtpConnect
 
         if (lease is null)
         {
+            var answer = Interlocked.Increment(ref _refusals) <= MaxConcurrentRefusals;
+
             try
             {
                 OnConnectionRefused(clientSocket.RemoteEndPoint);
-                await SendAndCloseAsync(clientSocket, "421 Too many connections, try again later.\r\n"u8.ToArray());
+
+                // Beyond the cap the socket is closed unanswered.
+                if (answer)
+                {
+                    await SendAndCloseAsync(clientSocket, "421 Too many connections, try again later.\r\n"u8.ToArray());
+                }
+                else
+                {
+                    clientSocket.Dispose();
+                }
             }
             catch
             {
                 // Nothing to do if even the refusal cannot be delivered - but the socket must
                 // still be closed, including when the notification callback itself throws.
                 try { clientSocket.Dispose(); } catch { /* already closed */ }
+            }
+            finally
+            {
+                Interlocked.Decrement(ref _refusals);
             }
 
             return;
@@ -246,6 +309,9 @@ public abstract class FtpListener(FtpSessionProvider sessionProvider, FtpConnect
             session = sessionProvider.CreateSession(connection);
             session.RemoteEndPoint = connection.Socket.RemoteEndPoint;
             session.LocalEndPoint = connection.Socket.LocalEndPoint;
+
+            // Closing the socket is what unblocks a reply the peer is not reading.
+            session.AbortTransport = connection.Dispose;
 
             await OnClientConnectedAsync(session, _shutdown.Token).ConfigureAwait(false);
 

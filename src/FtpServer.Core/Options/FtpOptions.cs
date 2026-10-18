@@ -191,6 +191,20 @@ public class FtpConnectionOptions
     public TimeSpan IdleTimeout { get; set; } = TimeSpan.FromMinutes(5);
 
     /// <summary>
+    /// Time a client has to log in, counted from the connection being accepted. A session that is
+    /// not logged in by then is answered 421 and closed. Commands sent before the login do not
+    /// extend it, so NOOP cannot be used to hold a connection slot.
+    /// </summary>
+    public TimeSpan LoginTimeout { get; set; } = TimeSpan.FromSeconds(60);
+
+    /// <summary>
+    /// Longest a reply on the control connection may take to be handed to the network. A client
+    /// that pipelines commands and stops reading would otherwise block the session forever; when
+    /// the deadline passes the connection is aborted.
+    /// </summary>
+    public TimeSpan WriteTimeout { get; set; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>
     /// Time allowed for a TLS handshake on the control or data connection.
     /// </summary>
     public TimeSpan TlsHandshakeTimeout { get; set; } = TimeSpan.FromSeconds(15);
@@ -239,6 +253,18 @@ public class FtpDataConnectionOptions
     /// client that opens a data connection and stalls holds its session slot indefinitely.
     /// </remarks>
     public TimeSpan InactivityTimeout { get; set; } = TimeSpan.FromMinutes(2);
+
+    /// <summary>
+    /// Largest file, in bytes, a client may upload; null (the default) means unlimited.
+    /// </summary>
+    /// <remarks>
+    /// Counted on the bytes written to the file, that is after MODE Z decompression, so a small
+    /// compressed stream cannot expand past it. It limits the size the file ends up with, so an
+    /// APPE or an upload resumed with REST only gets the room that is left. An upload that would
+    /// go past it is answered 552 and treated as aborted: what was written so far stays, as with
+    /// any other interrupted upload.
+    /// </remarks>
+    public long? MaxUploadSize { get; set; }
 }
 
 public class FtpCertificateOptions

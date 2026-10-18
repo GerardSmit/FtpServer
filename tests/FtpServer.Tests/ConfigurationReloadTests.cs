@@ -111,7 +111,9 @@ public class ConfigurationReloadTests : IDisposable
     [Fact]
     public async Task A_user_added_while_the_server_runs_can_log_in()
     {
-        WriteConfig("""{ "Path": "ftproot", "Authentication": { "Users": [] } }""");
+        // The wait below retries a login that is refused until the reload lands; the per-user
+        // lockout would otherwise count those retries.
+        WriteConfig("""{ "Path": "ftproot", "Authentication": { "MaxFailedAttempts": 0, "Users": [] } }""");
 
         var (_, authenticator) = Build();
 

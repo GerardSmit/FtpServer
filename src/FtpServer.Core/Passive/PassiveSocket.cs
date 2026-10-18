@@ -6,25 +6,45 @@ using Microsoft.Extensions.Logging;
 
 namespace FtpServer;
 
-public sealed class PassiveSocket(int port, ILogger<PassiveSocket> logger) : IAsyncDisposable
+public sealed class PassiveSocket(int port, ILogger<PassiveSocket> logger, TimeSpan? failureCooldown = null) : IAsyncDisposable
 {
+    /// <summary>
+    /// How long a port that could not be bound, or stopped accepting, is left alone before it is
+    /// tried again.
+    /// </summary>
+    public static readonly TimeSpan DefaultFailureCooldown = TimeSpan.FromMinutes(1);
+
+    private readonly TimeSpan _failureCooldown = failureCooldown ?? DefaultFailureCooldown;
+
     private readonly ConcurrentDictionary<IPAddress, PassiveSocketOwner> _activeSockets = new();
     private readonly SemaphoreSlim _semaphore = new(1, 1);
     private readonly CancellationTokenSource _cancellationTokenSource = new();
     private PassiveSocketOwner? _globalSocketOwner;
     private Task? _backgroundTask;
-    private volatile bool _invalid;
+
+    /// <summary>
+    /// <see cref="Environment.TickCount64"/> before which the port is not tried; zero when it is
+    /// fine. A bind can fail for a reason that passes - the port briefly held by another process -
+    /// so it is skipped for a while rather than for the life of the process.
+    /// </summary>
+    private long _unavailableUntil;
 
     public int Port => port;
 
+    private bool IsCoolingDown => Environment.TickCount64 < Volatile.Read(ref _unavailableUntil);
+
+    private void StartCooldown() =>
+        Volatile.Write(ref _unavailableUntil, Environment.TickCount64 + Math.Max(1, (long)_failureCooldown.TotalMilliseconds));
+
     private async ValueTask<bool> EnsureListeningAsync()
     {
-        if (_invalid)
+        if (IsCoolingDown)
         {
             return false;
         }
 
-        if (Volatile.Read(ref _backgroundTask) is not null)
+        // A loop that has ended counts as not listening, so a port that cooled down is bound again.
+        if (Volatile.Read(ref _backgroundTask) is { IsCompleted: false })
         {
             return true;
         }
@@ -33,12 +53,12 @@ public sealed class PassiveSocket(int port, ILogger<PassiveSocket> logger) : IAs
 
         try
         {
-            if (_invalid)
+            if (IsCoolingDown)
             {
                 return false;
             }
 
-            if (_backgroundTask is not null)
+            if (_backgroundTask is { IsCompleted: false })
             {
                 return true;
             }
@@ -65,8 +85,8 @@ public sealed class PassiveSocket(int port, ILogger<PassiveSocket> logger) : IAs
         }
         catch (Exception e)
         {
-            // Most likely the port is already in use; skip it for the lifetime of the process.
-            _invalid = true;
+            // Most likely the port is already in use; leave it alone for a while.
+            StartCooldown();
             Log.CouldNotStartPassiveSocket(logger, e);
             return false;
         }
@@ -162,9 +182,10 @@ public sealed class PassiveSocket(int port, ILogger<PassiveSocket> logger) : IAs
         }
         finally
         {
-            // Whatever ended the loop, this port can no longer accept. Marking it invalid stops
-            // TryRentAsync handing out a dead port ahead of every working one.
-            _invalid = true;
+            // Whatever ended the loop, this port can no longer accept. Cooling it down stops
+            // TryRentAsync handing out a dead port ahead of every working one, and lets it back in
+            // once the cause has had time to pass.
+            StartCooldown();
 
             CancelOwners();
 

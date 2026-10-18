@@ -23,6 +23,10 @@ public class FtpKestrelConnectionHandler(
         session.RemoteEndPoint = connection.RemoteEndPoint;
         session.LocalEndPoint = connection.LocalEndPoint;
 
+        // A peer that stops reading would otherwise keep a blocked reply, and the connection,
+        // alive; Kestrel only closes the transport on request.
+        session.AbortTransport = connection.Abort;
+
         await connectionHandler.HandleConnection(session, connection.Transport, connection.ConnectionClosed, ImplicitTls);
     }
 

@@ -65,6 +65,23 @@ public partial class DefaultFtpCommandHandler(
         return true;
     }
 
+    /// <summary>
+    /// Rejects a command that would open a data connection in the clear while
+    /// <see cref="FtpOptions.RequireTls"/> is on. Without this the policy would protect the
+    /// password and nothing else: the files themselves would still travel readable.
+    /// </summary>
+    private bool TryRejectClearData(FtpSession session, out ValueTask reply)
+    {
+        if (!options.Current.RequireTls || session.DataConnectionMode != FtpDataConnectionMode.Clear)
+        {
+            reply = ValueTask.CompletedTask;
+            return false;
+        }
+
+        reply = session.WriteAsync("521 Data connections must be protected (PROT P).\r\n"u8);
+        return true;
+    }
+
     private static bool TryRejectReadOnly(FtpSession session, out ValueTask reply)
     {
         if (session.CanWrite)
@@ -302,6 +319,11 @@ public partial class DefaultFtpCommandHandler(
         switch ((char)level[0])
         {
             case 'C' or 'c':
+                if (options.Current.RequireTls)
+                {
+                    return session.WriteAsync("534 Request denied for policy reasons.\r\n"u8, token);
+                }
+
                 session.DataConnectionMode = FtpDataConnectionMode.Clear;
                 return session.WriteAsync("200 Protection level set to C.\r\n"u8, token);
 

@@ -48,7 +48,14 @@ public partial class FtpConnectionHandler(
         var didSwitchProtocol = false;
         Task? activeTransfer = null;
 
-        using var cts = CancellationTokenSource.CreateLinkedTokenSource(lifetime.ApplicationStopping, token);
+        // The session's own token is cancelled when a reply cannot be written in time, which
+        // stops the read loop below as surely as a shutdown does.
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(lifetime.ApplicationStopping, token, session.Aborted);
+
+        // Counted from here, and again from the moment a login is dropped: what a client sends
+        // while it is not logged in must not push the deadline back.
+        var loginStarted = Stopwatch.GetTimestamp();
+        var wasAuthenticated = false;
 
         if (implicitTls)
         {
@@ -87,13 +94,46 @@ public partial class FtpConnectionHandler(
                     ? Timeout.InfiniteTimeSpan
                     : connection.IdleTimeout;
 
+                // Whichever of the two limits comes first ends the wait. The login limit is not
+                // restarted by traffic, only by the login being dropped and starting over.
+                var loginLimited = false;
+
+                if (session.IsAuthenticated)
+                {
+                    wasAuthenticated = true;
+                }
+                else
+                {
+                    if (wasAuthenticated)
+                    {
+                        wasAuthenticated = false;
+                        loginStarted = Stopwatch.GetTimestamp();
+                    }
+
+                    var remaining = connection.LoginTimeout - Stopwatch.GetElapsedTime(loginStarted);
+
+                    if (remaining <= TimeSpan.Zero)
+                    {
+                        await TryWriteAsync(session, "421 Login timeout.\r\n"u8);
+                        break;
+                    }
+
+                    if (idleTimeout == Timeout.InfiniteTimeSpan || remaining < idleTimeout)
+                    {
+                        idleTimeout = remaining;
+                        loginLimited = true;
+                    }
+                }
+
                 try
                 {
                     result = await ReadAsync(input, idleTimeout, cts.Token);
                 }
                 catch (IdleTimeoutException)
                 {
-                    await TryWriteAsync(session, "421 Idle timeout, closing control connection.\r\n"u8);
+                    await TryWriteAsync(session, loginLimited
+                        ? "421 Login timeout.\r\n"u8
+                        : "421 Idle timeout, closing control connection.\r\n"u8);
                     break;
                 }
                 catch (OperationCanceledException) when (lifetime.ApplicationStopping.IsCancellationRequested)
@@ -229,7 +269,7 @@ public partial class FtpConnectionHandler(
                             }
 
                             // QUIT, or a handler that answered 421 and therefore promised to close.
-                            if (command == FtpCommand.Disconnect || session.CloseRequested)
+                            if (command == FtpCommand.Disconnect || session.CloseRequested || session.IsAborted)
                             {
                                 close = true;
                                 break;
@@ -352,8 +392,12 @@ public partial class FtpConnectionHandler(
             }
 
             // A closing reply (421/221) has only reached the socket layer at this point, and
-            // disposing the connection now can discard it.
-            await LingerAsync(input);
+            // disposing the connection now can discard it. Not after an abort: the peer is not
+            // reading, and nothing was sent that it needs to see arrive.
+            if (!session.IsAborted)
+            {
+                await LingerAsync(input);
+            }
 
             if (didSwitchProtocol)
             {
@@ -484,6 +528,11 @@ public partial class FtpConnectionHandler(
         try
         {
             await handler.HandleAsync(session, command, data, token);
+        }
+        catch (Exception) when (session.IsAborted)
+        {
+            // The connection has been given up on; the read loop ends with it, and there is
+            // nobody left to answer.
         }
         catch (FtpDataConnectionException ex)
         {

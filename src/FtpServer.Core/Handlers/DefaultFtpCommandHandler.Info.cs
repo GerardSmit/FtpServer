@@ -136,7 +136,9 @@ public partial class DefaultFtpCommandHandler
                 // RFC 2640; clients send both "OPTS UTF8 ON" and a bare "OPTS UTF8".
                 if (argument.Length == 0 || argument.Equals("ON", StringComparison.OrdinalIgnoreCase))
                 {
-                    session.Encoding = new System.Text.UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
+                    // The strict decoder, not a fresh UTF8Encoding: that one turns invalid bytes into
+                    // U+FFFD, which aliases distinct byte strings onto one pathname.
+                    session.Encoding = FtpSession.DefaultEncoding;
                     return session.WriteAsync("200 UTF8 set to on.\r\n"u8, token);
                 }
 
@@ -571,7 +573,8 @@ public partial class DefaultFtpCommandHandler
 
         var modeText = argument[..space];
 
-        if (modeText.Length is < 3 or > 4 || !TryParseOctal(modeText, out var mode))
+        // Permission bits only: setuid, setgid and sticky are not something an FTP user gets to set.
+        if (modeText.Length is < 3 or > 4 || !TryParseOctal(modeText, out var mode) || mode > MaxPermissionBits)
         {
             return session.WriteAsync("501 Invalid mode.\r\n"u8, token);
         }
@@ -579,6 +582,11 @@ public partial class DefaultFtpCommandHandler
         if (!SequenceExtensions.TryResolvePath(argument[(space + 1)..], session.CurrentDirectory, out var path))
         {
             return session.WriteAsync("550 Invalid path.\r\n"u8, token);
+        }
+
+        if (path == UPath.Root)
+        {
+            return session.WriteAsync("550 Requested action not taken: the mode of the root directory cannot be changed.\r\n"u8, token);
         }
 
         if (TryRejectReadOnlyPath(session, path, out readOnly))
@@ -914,6 +922,9 @@ public partial class DefaultFtpCommandHandler
         second = argument[end..].Trim();
         return first.Length > 0 && second.Length > 0;
     }
+
+    /// <summary>The permission bits a client may set: 0777, without setuid, setgid or sticky.</summary>
+    private const int MaxPermissionBits = 0x1FF;
 
     private static bool TryParseOctal(string value, out int result)
     {

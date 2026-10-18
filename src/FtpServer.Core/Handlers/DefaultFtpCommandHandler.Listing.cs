@@ -42,6 +42,12 @@ public partial class DefaultFtpCommandHandler
             return;
         }
 
+        if (TryRejectClearData(session, out rejected))
+        {
+            await rejected;
+            return;
+        }
+
         if (!TryParseListArgument(session, data, format, out var request))
         {
             await session.WriteAsync("550 Invalid path.\r\n"u8, token);

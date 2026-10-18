@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using System.Net;
 using System.Security.Cryptography;
 using System.Text;
@@ -10,11 +9,20 @@ namespace FtpServer.Authentication;
 
 /// <summary>
 /// Authenticates against the user list in <see cref="FtpAuthenticationOptions"/>, with
-/// per-address throttling of failed attempts (RFC 2577 section 3).
+/// per-address and per-user throttling of failed attempts (RFC 2577 section 3).
 /// </summary>
 /// <remarks>
+/// <para>
 /// Reads through <see cref="FtpOptionsProvider"/>, so an account added to the configuration file
 /// while the server is running can log in without a restart.
+/// </para>
+/// <para>
+/// An attempt is counted before its password is checked and given back if it succeeds, so
+/// connections running in parallel cannot between them exceed the limit while the check is still
+/// busy. A success does not clear what the address has failed before: the failures just expire,
+/// otherwise a login to an account the attacker owns (or the anonymous one) between guesses would
+/// keep the count at zero.
+/// </para>
 /// </remarks>
 public sealed class DefaultFtpAuthenticator(
     FtpOptionsProvider options,
@@ -22,13 +30,21 @@ public sealed class DefaultFtpAuthenticator(
     ILogger<DefaultFtpAuthenticator> logger
 ) : IFtpAuthenticator
 {
-    private readonly ConcurrentDictionary<string, FailureRecord> _failures = new();
+    /// <summary>
+    /// Verified against when the user does not exist, so that a wrong name costs as much time as
+    /// a wrong password for a real account.
+    /// </summary>
+    private static readonly string DummyHash = PasswordHash.Create("dummy-password-for-unknown-users");
+
+    private readonly Lock _gate = new();
+    private readonly Dictionary<string, FailureRecord> _failures = new();
+    private readonly Dictionary<string, FailureRecord> _userFailures = new(StringComparer.OrdinalIgnoreCase);
 
     public ValueTask<FtpAuthenticationResult> AuthenticateUserAsync(string userName, EndPoint? remoteEndPoint, CancellationToken token)
     {
         if (IsLockedOut(remoteEndPoint))
         {
-            Log.LoginLockedOut(logger, userName, Describe(remoteEndPoint));
+            Log.LoginLockedOut(logger, FtpLogText.Sanitise(userName), Describe(remoteEndPoint));
             return new ValueTask<FtpAuthenticationResult>(FtpAuthenticationResult.TooManyAttempts);
         }
 
@@ -39,10 +55,14 @@ public sealed class DefaultFtpAuthenticator(
     public async ValueTask<FtpAuthenticationResult> AuthenticatePasswordAsync(string userName, string password, EndPoint? remoteEndPoint, CancellationToken token)
     {
         var auth = options.Current.Authentication;
+        var addressKey = Key(remoteEndPoint);
+        var userKey = UserKey(userName);
 
-        if (IsLockedOut(remoteEndPoint))
+        // Counted now, before the slow part: a check that is still running must not leave room
+        // for another connection to try as well.
+        if (!TryReserve(addressKey, userKey, auth))
         {
-            Log.LoginLockedOut(logger, userName, Describe(remoteEndPoint));
+            Log.LoginLockedOut(logger, FtpLogText.Sanitise(userName), Describe(remoteEndPoint));
             return FtpAuthenticationResult.TooManyAttempts;
         }
 
@@ -50,13 +70,12 @@ public sealed class DefaultFtpAuthenticator(
 
         if (user is not null)
         {
-            ClearFailures(remoteEndPoint);
-            Log.LoginSucceeded(logger, user.Name, Describe(remoteEndPoint));
+            Release(addressKey, userKey);
+            Log.LoginSucceeded(logger, FtpLogText.Sanitise(user.Name), Describe(remoteEndPoint));
             return FtpAuthenticationResult.Success(user);
         }
 
-        RecordFailure(remoteEndPoint);
-        Log.LoginFailed(logger, userName, Describe(remoteEndPoint));
+        Log.LoginFailed(logger, FtpLogText.Sanitise(userName), Describe(remoteEndPoint));
 
         if (auth.FailureDelay > TimeSpan.Zero)
         {
@@ -108,6 +127,10 @@ public sealed class DefaultFtpAuthenticator(
 
             return new FtpUser(candidate.Name, isAnonymous: false, candidate.ReadOnly, candidate.HomeDirectory, fileSystem);
         }
+
+        // No such account: do the same work a real one would cost, so the time taken does not
+        // say whether the name exists.
+        PasswordHash.Verify(DummyHash, password);
 
         return null;
     }
@@ -170,64 +193,125 @@ public sealed class DefaultFtpAuthenticator(
             return false;
         }
 
-        if (!_failures.TryGetValue(key, out var record))
+        lock (_gate)
+        {
+            return IsLockedOut(_failures, key, auth, DateTimeOffset.UtcNow);
+        }
+    }
+
+    private static bool IsLockedOut(Dictionary<string, FailureRecord> failures, string? key, FtpAuthenticationOptions auth, DateTimeOffset now)
+    {
+        if (key is null || !failures.TryGetValue(key, out var record))
         {
             return false;
         }
 
-        if (DateTimeOffset.UtcNow - record.Last > auth.LockoutDuration)
+        if (now - record.Last > auth.LockoutDuration)
         {
-            _failures.TryRemove(key, out _);
+            failures.Remove(key);
             return false;
         }
 
         return record.Count >= auth.MaxFailedAttempts;
     }
 
-    /// <summary>Entries only expire when the same address reconnects, so the map is swept too.</summary>
+    /// <summary>Entries only expire when the same key comes back, so the maps are swept too.</summary>
     private const int SweepThreshold = 1024;
 
-    private void RecordFailure(EndPoint? remoteEndPoint)
+    /// <summary>
+    /// Most user names tracked at once. Names are chosen by the client, so without a bound a
+    /// flood of made-up ones would grow the map for as long as the lockout lasts.
+    /// </summary>
+    private const int MaxTrackedUsers = 10_000;
+
+    /// <summary>Longest user name kept as a key; a longer one is cut, which only makes it stricter.</summary>
+    private const int MaxUserKeyLength = 256;
+
+    /// <summary>
+    /// Counts an attempt against the address and the user, unless either is already locked out.
+    /// </summary>
+    /// <returns><c>false</c> when the attempt is refused outright.</returns>
+    private bool TryReserve(string? addressKey, string userKey, FtpAuthenticationOptions auth)
     {
-        if (Key(remoteEndPoint) is not { } key)
+        if (auth.MaxFailedAttempts <= 0)
         {
-            return;
+            return true;
         }
 
-        _failures.AddOrUpdate(
-            key,
-            static _ => new FailureRecord(1, DateTimeOffset.UtcNow),
-            static (_, existing) => new FailureRecord(existing.Count + 1, DateTimeOffset.UtcNow));
+        var now = DateTimeOffset.UtcNow;
 
-        // Without this the map grows for the life of the process: one failed login from each of
-        // many addresses (a botnet, or any host with a /64) leaves a permanent entry apiece.
-        if (_failures.Count > SweepThreshold)
+        lock (_gate)
         {
-            SweepExpired();
-        }
-    }
-
-    private void SweepExpired()
-    {
-        var cutoff = DateTimeOffset.UtcNow - options.Current.Authentication.LockoutDuration;
-
-        foreach (var entry in _failures)
-        {
-            if (entry.Value.Last < cutoff)
+            if (IsLockedOut(_failures, addressKey, auth, now) ||
+                IsLockedOut(_userFailures, userKey, auth, now))
             {
-                // Remove only if unchanged, so a concurrent failure is not discarded.
-                ((ICollection<KeyValuePair<string, FailureRecord>>)_failures).Remove(entry);
+                return false;
             }
+
+            if (addressKey is not null)
+            {
+                Count(_failures, addressKey, now);
+            }
+
+            if (_userFailures.ContainsKey(userKey) || _userFailures.Count < MaxTrackedUsers)
+            {
+                Count(_userFailures, userKey, now);
+            }
+
+            // Without this the maps grow for the life of the process: one failed login from each
+            // of many addresses (a botnet, or any host with a /64) leaves a permanent entry apiece.
+            if (_failures.Count > SweepThreshold || _userFailures.Count > SweepThreshold)
+            {
+                var cutoff = now - auth.LockoutDuration;
+
+                Sweep(_failures, cutoff);
+                Sweep(_userFailures, cutoff);
+            }
+
+            return true;
         }
     }
 
-    private void ClearFailures(EndPoint? remoteEndPoint)
+    private static void Count(Dictionary<string, FailureRecord> failures, string key, DateTimeOffset now) =>
+        failures[key] = failures.TryGetValue(key, out var existing)
+            ? new FailureRecord(existing.Count + 1, now)
+            : new FailureRecord(1, now);
+
+    /// <summary>
+    /// Gives back the attempt of a login that succeeded. Failures from before it stay, and expire
+    /// on their own; the user's own count is cleared, as the account has now been proven to be in
+    /// the right hands.
+    /// </summary>
+    private void Release(string? addressKey, string userKey)
     {
-        if (Key(remoteEndPoint) is { } key)
+        lock (_gate)
         {
-            _failures.TryRemove(key, out _);
+            if (addressKey is not null && _failures.TryGetValue(addressKey, out var record))
+            {
+                if (record.Count <= 1)
+                {
+                    _failures.Remove(addressKey);
+                }
+                else
+                {
+                    _failures[addressKey] = record with { Count = record.Count - 1 };
+                }
+            }
+
+            _userFailures.Remove(userKey);
         }
     }
+
+    private static void Sweep(Dictionary<string, FailureRecord> failures, DateTimeOffset cutoff)
+    {
+        foreach (var entry in failures.Where(entry => entry.Value.Last < cutoff).ToList())
+        {
+            failures.Remove(entry.Key);
+        }
+    }
+
+    private static string UserKey(string userName) =>
+        userName.Length > MaxUserKeyLength ? userName[..MaxUserKeyLength] : userName;
 
     private static string? Key(EndPoint? remoteEndPoint) =>
         remoteEndPoint is IPEndPoint ip ? ip.Address.ToString() : null;

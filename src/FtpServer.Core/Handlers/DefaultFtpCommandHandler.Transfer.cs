@@ -318,9 +318,18 @@ public partial class DefaultFtpCommandHandler
         CancellationToken token,
         string? openingReply = null)
     {
+        // Before the 150, and before the restart marker is consumed: the client can fix its
+        // protection level and repeat the command.
+        if (TryRejectClearData(session, out var clearData))
+        {
+            await clearData;
+            return;
+        }
+
         var offset = session.RestartOffset;
         session.RestartOffset = 0;
         var inactivity = options.Current.DataConnection.InactivityTimeout;
+        var maxUploadSize = options.Current.DataConnection.MaxUploadSize;
 
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(token);
 
@@ -361,7 +370,7 @@ public partial class DefaultFtpCommandHandler
                 else
                 {
                     await UseDataStreamAsync(session, channel.Stream, sending: false,
-                        stream => UploadAsync(session, path, stream, mode, offset, inactivity, cts.Token));
+                        stream => UploadAsync(session, path, stream, mode, offset, inactivity, maxUploadSize, cts.Token));
                 }
             }
 
@@ -557,7 +566,7 @@ public partial class DefaultFtpCommandHandler
         }
     }
 
-    private static async ValueTask UploadAsync(FtpSession session, UPath path, Stream source, FileMode mode, long offset, TimeSpan inactivity, CancellationToken token)
+    private static async ValueTask UploadAsync(FtpSession session, UPath path, Stream source, FileMode mode, long offset, TimeSpan inactivity, long? maxSize, CancellationToken token)
     {
         // A restart marker must not truncate: FileMode.Create zeroes the file at open, so the seek
         // would land at 0 and the resumed tail would overwrite the start.
@@ -581,15 +590,22 @@ public partial class DefaultFtpCommandHandler
             destination.Seek(offset, SeekOrigin.Begin);
         }
 
+        // Counted on what reaches the file, so MODE Z cannot expand past it and TYPE A's line
+        // ending translation is taken into account. The limit is on the size of the file the
+        // upload leaves behind, so an APPE or a resumed upload only gets what room is left.
+        Stream target = maxSize is { } limit
+            ? new CappedWriteStream(destination, Math.Max(0, limit - destination.Position))
+            : destination;
+
         try
         {
             if (session.TransferType == FtpTransferType.Ascii)
             {
-                await AsciiTransfer.FromNetworkAsync(source, destination, inactivity, token);
+                await AsciiTransfer.FromNetworkAsync(source, target, inactivity, token);
             }
             else
             {
-                await CopyAsync(source, destination, inactivity, token);
+                await CopyAsync(source, target, inactivity, token);
             }
 
             await destination.FlushAsync(token);
@@ -929,10 +945,12 @@ public partial class DefaultFtpCommandHandler
                     break;
 
                 case "unix.mode" when CanSetUnixMode:
-                    // Up to four octal digits (setuid/setgid/sticky included), leading zeros allowed.
+                    // Up to four octal digits, leading zeros allowed, but only the permission bits.
                     var digits = value.TrimStart('0');
 
-                    if (value.Length > 5 || digits.Length > 4 || !TryParseOctal(digits.Length == 0 ? "0" : digits, out var bits))
+                    if (value.Length > 5 || digits.Length > 4 ||
+                        !TryParseOctal(digits.Length == 0 ? "0" : digits, out var bits) ||
+                        bits > MaxPermissionBits)
                     {
                         return session.WriteAsync("501 Invalid value for fact "u8, name, ".\r\n"u8, token);
                     }
@@ -957,8 +975,13 @@ public partial class DefaultFtpCommandHandler
             return reply;
         }
 
-        // A remote tree has no host path to set the mode on. Refused before anything is applied,
-        // because MFF is all or nothing.
+        // Refused before anything is applied, because MFF is all or nothing.
+        if (modeFact is not null && path == UPath.Root)
+        {
+            return session.WriteAsync("550 Requested action not taken: the mode of the root directory cannot be changed.\r\n"u8, token);
+        }
+
+        // A remote tree has no host path to set the mode on.
         if (modeFact is not null && !FtpFileSystemCapabilities.HasHostPath(session.FileSystem, path))
         {
             return session.WriteAsync("504 Fact "u8, modeFact, " cannot be modified.\r\n"u8, token);
@@ -997,6 +1020,77 @@ public partial class DefaultFtpCommandHandler
         "modify;" +
         (CanSetCreationTime ? "create;" : string.Empty) +
         (CanSetUnixMode && FtpFileSystemCapabilities.HasHostPath(session.FileSystem, UPath.Root) ? "UNIX.mode;" : string.Empty);
+}
+
+/// <summary>
+/// Passes writes through to a file until <c>remaining</c> bytes have been written, and refuses the
+/// write that would go past it with the 552 an over-sized upload is answered with.
+/// </summary>
+/// <remarks>
+/// Refuses before writing rather than cutting the chunk, so the file never exceeds the limit and
+/// nothing is written that is about to be reported as aborted.
+/// </remarks>
+internal sealed class CappedWriteStream(Stream inner, long remaining) : Stream
+{
+    private long _remaining = remaining;
+
+    public override bool CanRead => false;
+
+    public override bool CanSeek => false;
+
+    public override bool CanWrite => true;
+
+    public override long Length => throw new NotSupportedException();
+
+    public override long Position
+    {
+        get => throw new NotSupportedException();
+        set => throw new NotSupportedException();
+    }
+
+    private void Reserve(int count)
+    {
+        if (count > _remaining)
+        {
+            throw new FtpDataConnectionException("552 Requested file action aborted. Exceeded storage allocation.");
+        }
+
+        _remaining -= count;
+    }
+
+    public override void Write(byte[] buffer, int offset, int count)
+    {
+        Reserve(count);
+        inner.Write(buffer, offset, count);
+    }
+
+    public override void Write(ReadOnlySpan<byte> buffer)
+    {
+        Reserve(buffer.Length);
+        inner.Write(buffer);
+    }
+
+    public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default)
+    {
+        Reserve(buffer.Length);
+        return inner.WriteAsync(buffer, cancellationToken);
+    }
+
+    public override Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+    {
+        Reserve(count);
+        return inner.WriteAsync(buffer, offset, count, cancellationToken);
+    }
+
+    public override void Flush() => inner.Flush();
+
+    public override Task FlushAsync(CancellationToken cancellationToken) => inner.FlushAsync(cancellationToken);
+
+    public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+    public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+
+    public override void SetLength(long value) => throw new NotSupportedException();
 }
 
 /// <summary>

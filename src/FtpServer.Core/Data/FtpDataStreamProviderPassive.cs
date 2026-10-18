@@ -24,6 +24,12 @@ public sealed class FtpDataStreamProviderPassive(PassiveSocketOwner owner, EndPo
         // A passive port serves exactly one transfer; the next one needs a fresh PASV.
         session.DataStreamProvider = Active;
 
+        // Past the time the client had to connect after PASV, the port has gone back to the pool.
+        if (!owner.TryClaim())
+        {
+            throw new FtpDataConnectionException("425 Can't open data connection: timed out waiting for the client.");
+        }
+
         var options = session.RootServiceProvider.GetRequiredService<FtpOptionsProvider>().Current;
         Socket socket;
 

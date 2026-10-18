@@ -6,6 +6,7 @@ using FtpServer.Authentication;
 using FtpServer.Data;
 using FtpServer.IO;
 using FtpServer.Utils;
+using Microsoft.Extensions.DependencyInjection;
 using Zio;
 
 namespace FtpServer;
@@ -17,6 +18,7 @@ public sealed class FtpSession(
 ) : IAsyncDisposable
 {
     private readonly SemaphoreSlim _writeLock = new(1, 1);
+    private readonly CancellationTokenSource _aborted = new();
     private bool _disposed;
 
     public FtpDataStreamProvider DataStreamProvider { get; set; } = FtpDataStreamProvider.Active;
@@ -266,14 +268,83 @@ public sealed class FtpSession(
 
     // ---- replies ----------------------------------------------------------
 
+    /// <summary>
+    /// Cancelled once the connection has been given up on (see <see cref="Abort"/>). The
+    /// connection handler links its own token to this one, so the read loop stops with it.
+    /// </summary>
+    public CancellationToken Aborted => _aborted.Token;
+
+    /// <summary>True once <see cref="Abort"/> has been called.</summary>
+    public bool IsAborted => _aborted.IsCancellationRequested;
+
+    /// <summary>
+    /// Closes the underlying connection, set by whatever accepted it. Without it an abort only
+    /// stops the session; the transport is then closed when the session's owner returns.
+    /// </summary>
+    public Action? AbortTransport { get; set; }
+
+    /// <summary>
+    /// Gives up on the control connection: stops the session and closes the transport, so a peer
+    /// that has stopped reading cannot keep a blocked write - and the session slot - alive.
+    /// </summary>
+    public void Abort()
+    {
+        try
+        {
+            _aborted.Cancel();
+        }
+        catch (ObjectDisposedException)
+        {
+            // The session is already gone.
+        }
+
+        try
+        {
+            AbortTransport?.Invoke();
+        }
+        catch
+        {
+            // Already closed.
+        }
+    }
+
     private async ValueTask WriteCoreAsync(ReadOnlyMemory<byte> data, CancellationToken token)
     {
+        if (IsAborted)
+        {
+            throw new IOException("The control connection was aborted.");
+        }
+
         await _writeLock.WaitAsync(token).ConfigureAwait(false);
 
         try
         {
             Transport.Output.Write(data.Span);
-            await Transport.Output.FlushAsync(token).GetAsValueTask().ConfigureAwait(false);
+
+            // The idle timer only covers reads. A client that pipelines commands and stops
+            // reading fills the send buffer, after which this flush never completes.
+            var timeout = RootServiceProvider.GetService<FtpOptionsProvider>()?.Current.Connection.WriteTimeout
+                ?? Timeout.InfiniteTimeSpan;
+
+            if (timeout <= TimeSpan.Zero || timeout == Timeout.InfiniteTimeSpan)
+            {
+                await Transport.Output.FlushAsync(token).GetAsValueTask().ConfigureAwait(false);
+                return;
+            }
+
+            using var deadline = CancellationTokenSource.CreateLinkedTokenSource(token);
+            deadline.CancelAfter(timeout);
+
+            try
+            {
+                await Transport.Output.FlushAsync(deadline.Token).GetAsValueTask().ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (deadline.IsCancellationRequested && !token.IsCancellationRequested)
+            {
+                // Part of the reply may be on the wire, so the stream cannot be continued.
+                Abort();
+                throw new IOException("Writing to the control connection timed out.");
+            }
         }
         finally
         {
@@ -461,6 +532,7 @@ public sealed class FtpSession(
         await DataStreamProvider.ReleaseAsync().ConfigureAwait(false);
 
         TransferCancellation?.Dispose();
+        _aborted.Dispose();
         _writeLock.Dispose();
         FileSystem.Dispose();
     }

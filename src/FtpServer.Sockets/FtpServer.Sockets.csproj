@@ -15,6 +15,10 @@
     </ItemGroup>
 
     <ItemGroup>
+        <InternalsVisibleTo Include="FtpServer.Tests" />
+    </ItemGroup>
+
+    <ItemGroup>
       <ProjectReference Include="..\FtpServer.Core\FtpServer.Core.csproj" />
     </ItemGroup>
 
