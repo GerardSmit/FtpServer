@@ -60,6 +60,14 @@ public partial class DefaultFtpCommandHandler
             return;
         }
 
+        // A directory that cannot be read is an error, not an empty listing: once 150 is sent a
+        // failure can only end the listing early, and a client shows what came as the whole folder.
+        if (!request.IsFile && ProbeDirectory(session, request.Path) is { } unreadable)
+        {
+            await session.WriteAsync(unreadable, token);
+            return;
+        }
+
         // With recursion switched off "-R" is one more presentation flag, like "-a".
         if (request.Recursive && !options.Current.Features.LISTR)
         {
@@ -298,6 +306,34 @@ public partial class DefaultFtpCommandHandler
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
             // A missing parent is not worth failing the whole listing over.
+        }
+    }
+
+    /// <summary>
+    /// Opens a directory and reads its first entry; the reply to give when that fails, null when it
+    /// can be listed. A file system that lists a directory in one go (a remote one) has it cached
+    /// for the listing itself after this.
+    /// </summary>
+    private string? ProbeDirectory(FtpSession session, UPath directory)
+    {
+        try
+        {
+            using var enumerator = session.FileSystem.EnumerateItems(directory, SearchOption.TopDirectoryOnly).GetEnumerator();
+            enumerator.MoveNext();
+            return null;
+        }
+        catch (DirectoryNotFoundException)
+        {
+            return "550 Directory not found.\r\n";
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return "550 Requested action not taken: access denied.\r\n";
+        }
+        catch (IOException ex)
+        {
+            Log.RequestException(logger, ex);
+            return "450 Requested file action not taken: the directory cannot be read.\r\n";
         }
     }
 

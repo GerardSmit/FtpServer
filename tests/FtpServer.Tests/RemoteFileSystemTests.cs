@@ -152,6 +152,23 @@ public class RemoteFileSystemTests
     }
 
     [Fact]
+    public async Task A_directory_the_remote_side_cannot_read_is_an_error_not_an_empty_listing()
+    {
+        // A worker that cannot be reached, or refuses the folder, must not look like an empty folder.
+        var fileSystem = new RemoteMemoryFileSystem { UnreadableDirectory = "/locked" };
+        await using var server = await StartAsync(fileSystem);
+        await using var client = await LoginAsync(server);
+
+        Assert.StartsWith("450", await client.SendAsync("LIST /locked"));
+        Assert.StartsWith("450", await client.SendAsync("MLSD /locked"));
+        Assert.StartsWith("450", await client.SendAsync("NLST /locked"));
+
+        var (list, control) = await client.DownloadAsync("LIST /");
+        Assert.Contains("226", control);
+        Assert.Contains("locked", Encoding.UTF8.GetString(list), StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task Chmod_and_symlinks_are_not_attempted_on_a_remote_tree()
     {
         var fileSystem = new RemoteMemoryFileSystem();
@@ -279,6 +296,13 @@ public class RemoteFileSystemTests
         }
 
         public UPath? ReadOnlyDirectory { get; init; }
+
+        public UPath? UnreadableDirectory { get; init; }
+
+        protected override IEnumerable<FileSystemItem> EnumerateItemsImpl(UPath path, SearchOption searchOption, SearchPredicate? searchPredicate) =>
+            path == UnreadableDirectory
+                ? throw new IOException("De server is niet bereikbaar.")
+                : base.EnumerateItemsImpl(path, searchOption, searchPredicate);
 
         public string? Digest { get; init; } = "DEADBEEF";
 
