@@ -272,8 +272,10 @@ server instead, because there is nothing to fall back on.
   restart and no client can verify it.
 - **Behind NAT, set `DataConnection.PublicAddress`** to the router's public IP and forward the
   passive port range (plus port 21) to the server. Without it, PASV advertises the private LAN
-  address, which internet clients cannot reach. LAN peers always get the real address, and EPSV
-  is unaffected because its reply never carries an address. The server does not open router
+  address, which internet clients cannot reach. Every peer but a loopback one gets it, LAN peers
+  included (in a container the local address is the container's, which they cannot reach either),
+  so it must be an address those reach too. EPSV is unaffected because its reply never carries an
+  address. The server does not open router
   ports itself (no UPnP/NAT-PMP) — forwarding must be configured on the router.
 
 ## Usage
