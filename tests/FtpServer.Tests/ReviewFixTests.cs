@@ -153,6 +153,18 @@ public class ReviewFixTests
     }
 
     [Fact]
+    public async Task Address_literal_of_the_public_address_is_accepted()
+    {
+        // Behind NAT or in a container clients name the public address, not the local endpoint's.
+        await using var server = await FtpServerFixture.StartAsync(o => o.DataConnection.PublicAddress = "192.0.2.1");
+
+        await using var client = await server.ConnectAsync();
+
+        Assert.StartsWith("220", await client.SendAsync("HOST 192.0.2.1"));
+        Assert.StartsWith("504", await client.SendAsync("HOST 192.0.2.2"));
+    }
+
+    [Fact]
     public async Task Second_host_resets_the_authentication_environment()
     {
         await using var server = await FtpServerFixture.StartAsync();

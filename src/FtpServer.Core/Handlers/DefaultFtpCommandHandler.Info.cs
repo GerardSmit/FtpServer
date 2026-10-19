@@ -371,8 +371,9 @@ public partial class DefaultFtpCommandHandler
         }
 
         // Section 3.2.1: a literal that is not this server's address is not a host it can serve.
-        // The session stays in the no-HOST state (section 3.3 option a) either way.
-        if (literal is not null && !IsLocalAddress(session, literal))
+        // The session stays in the no-HOST state (section 3.3 option a) either way. Behind NAT or in
+        // a container the address clients use is the public one, not the local endpoint's.
+        if (literal is not null && !IsLocalAddress(session, literal) && !IsPublicAddress(literal))
         {
             return session.WriteAsync("504 Command not implemented for that parameter.\r\n"u8, token);
         }
@@ -469,6 +470,12 @@ public partial class DefaultFtpCommandHandler
     /// True when <paramref name="literal"/> is the address this control connection was accepted
     /// on. An unknown local endpoint cannot be contradicted, so it accepts.
     /// </summary>
+    private bool IsPublicAddress(IPAddress literal)
+        => options.Current.DataConnection.PublicAddress is { Length: > 0 } configured &&
+           IPAddress.TryParse(configured, out var publicAddress) &&
+           (literal.IsIPv4MappedToIPv6 ? literal.MapToIPv4() : literal).Equals(
+               publicAddress.IsIPv4MappedToIPv6 ? publicAddress.MapToIPv4() : publicAddress);
+
     private static bool IsLocalAddress(FtpSession session, IPAddress literal)
     {
         if ((session.LocalEndPoint as IPEndPoint)?.Address is not { } local)

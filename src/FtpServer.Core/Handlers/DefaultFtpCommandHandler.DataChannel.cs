@@ -358,15 +358,23 @@ public partial class DefaultFtpCommandHandler
     /// <summary>
     /// Picks the address a PASV/LPSV reply advertises. The dual-stack listener reports an IPv4
     /// endpoint as ::ffff:a.b.c.d, which an IPv4 client cannot use, so it is normalised first.
-    /// A configured <see cref="Options.FtpDataConnectionOptions.PublicAddress"/> replaces it for
-    /// peers outside the private ranges, which is what makes the server reachable behind NAT.
     /// </summary>
     private IPAddress SelectAdvertisedAddress(IPAddress local, IPAddress? peer)
+        => SelectAdvertisedAddress(local, peer, options.Current.DataConnection.PublicAddress);
+
+    /// <summary>
+    /// A configured public address replaces the local one for every peer but a loopback one. A LAN
+    /// peer gets it too: behind Docker or another port forward the local address is the
+    /// container's, which no client can reach, and the peer a forward reports can be the
+    /// forwarder's own private address, so a private peer says nothing about which address works.
+    /// A client that took the reply literally (Beyond Compare does) then timed out on its data
+    /// connection, where clients that substitute the control address (FileZilla) did not notice.
+    /// </summary>
+    internal static IPAddress SelectAdvertisedAddress(IPAddress local, IPAddress? peer, string? configured)
     {
         var normalized = Normalize(local);
 
-        if (options.Current.DataConnection.PublicAddress is not { Length: > 0 } configured ||
-            !IPAddress.TryParse(configured, out var publicAddress))
+        if (configured is not { Length: > 0 } || !IPAddress.TryParse(configured, out var publicAddress))
         {
             return normalized;
         }
@@ -379,35 +387,13 @@ public partial class DefaultFtpCommandHandler
             return normalized;
         }
 
-        // A LAN peer keeps the LAN address: NAT hairpinning is unreliable and unnecessary here.
-        if (peer is null || IsPrivateOrLocal(Normalize(peer)))
+        // A client on the server itself reaches the local address, and may not reach the public one.
+        if (peer is not null && IPAddress.IsLoopback(Normalize(peer)))
         {
             return normalized;
         }
 
         return publicAddress;
-    }
-
-    /// <summary>RFC 1918/4193 private space plus loopback and link-local.</summary>
-    internal static bool IsPrivateOrLocal(IPAddress address)
-    {
-        if (IPAddress.IsLoopback(address))
-        {
-            return true;
-        }
-
-        if (address.AddressFamily == AddressFamily.InterNetwork)
-        {
-            Span<byte> bytes = stackalloc byte[4];
-            address.TryWriteBytes(bytes, out _);
-
-            return bytes[0] == 10 ||
-                   (bytes[0] == 172 && bytes[1] >= 16 && bytes[1] <= 31) ||
-                   (bytes[0] == 192 && bytes[1] == 168) ||
-                   (bytes[0] == 169 && bytes[1] == 254);
-        }
-
-        return address.IsIPv6LinkLocal || address.IsIPv6UniqueLocal || address.IsIPv6SiteLocal;
     }
 
     public override ValueTask SinglePortPassiveModeAsync(FtpSession session, ReadOnlySequence<byte> data, CancellationToken token)

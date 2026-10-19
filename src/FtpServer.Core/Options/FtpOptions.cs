@@ -229,9 +229,10 @@ public class FtpDataConnectionOptions
     public bool VerifyPeerAddress { get; set; } = true;
 
     /// <summary>
-    /// IP address advertised in PASV/LPSV replies when the server sits behind NAT, in place of the
-    /// private LAN address an internet client cannot reach. Only used for peers outside the
-    /// private/loopback ranges; EPSV never carries an address and is unaffected.
+    /// IP address advertised in PASV/LPSV replies when the server sits behind NAT or in a container,
+    /// in place of a local address the client cannot reach. Used for every peer but a loopback one,
+    /// LAN peers included, so it must be an address those reach too; EPSV never carries an address
+    /// and is unaffected.
     /// </summary>
     public string? PublicAddress { get; set; }
 

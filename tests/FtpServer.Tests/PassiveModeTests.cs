@@ -8,29 +8,41 @@ namespace FtpServer.Tests;
 public class PassiveModeTests
 {
     [Theory]
-    [InlineData("127.0.0.1")]
-    [InlineData("10.1.2.3")]
-    [InlineData("172.16.0.1")]
-    [InlineData("172.31.255.254")]
-    [InlineData("192.168.1.10")]
-    [InlineData("169.254.10.10")]
-    [InlineData("::1")]
-    [InlineData("fe80::1")]
-    [InlineData("fd00::1234")]
-    public void Private_and_local_addresses_are_recognised(string address)
+    [InlineData("203.0.113.7")]
+    [InlineData("192.168.10.210")]
+    [InlineData("172.18.0.1")]
+    [InlineData("::ffff:192.168.10.210")]
+    public void A_public_address_is_advertised_to_lan_and_internet_peers(string peer)
     {
-        Assert.True(DefaultFtpCommandHandler.IsPrivateOrLocal(IPAddress.Parse(address)));
+        // Behind Docker the local address is the container's; a LAN client cannot reach it either.
+        var advertised = DefaultFtpCommandHandler.SelectAdvertisedAddress(
+            IPAddress.Parse("::ffff:172.18.0.2"), IPAddress.Parse(peer), "192.168.10.73");
+
+        Assert.Equal(IPAddress.Parse("192.168.10.73"), advertised);
     }
 
     [Theory]
-    [InlineData("8.8.8.8")]
-    [InlineData("172.15.0.1")]
-    [InlineData("172.32.0.1")]
-    [InlineData("193.168.1.1")]
-    [InlineData("2001:db8::1")]
-    public void Public_addresses_are_not_flagged_private(string address)
+    [InlineData("127.0.0.1")]
+    [InlineData("::ffff:127.0.0.1")]
+    public void A_loopback_peer_keeps_the_local_address(string peer)
     {
-        Assert.False(DefaultFtpCommandHandler.IsPrivateOrLocal(IPAddress.Parse(address)));
+        var advertised = DefaultFtpCommandHandler.SelectAdvertisedAddress(
+            IPAddress.Parse("::ffff:127.0.0.1"), IPAddress.Parse(peer), "192.168.10.73");
+
+        Assert.Equal(IPAddress.Parse("127.0.0.1"), advertised);
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("not-an-address")]
+    [InlineData("2001:db8::1")]
+    public void Without_a_usable_public_address_the_local_one_is_advertised(string? configured)
+    {
+        var advertised = DefaultFtpCommandHandler.SelectAdvertisedAddress(
+            IPAddress.Parse("::ffff:10.0.0.5"), IPAddress.Parse("203.0.113.7"), configured);
+
+        Assert.Equal(IPAddress.Parse("10.0.0.5"), advertised);
     }
 
     [Fact]

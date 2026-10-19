@@ -90,18 +90,45 @@ public sealed class FtpServerFixture : IAsyncDisposable
     /// </remarks>
     private static (int Control, int PassiveStart, int PassiveEnd) ReservePorts()
     {
-        var block = Interlocked.Increment(ref _passiveBlock);
-        var start = PassiveBase + (block * PassiveBlockSize);
+        int start;
 
-        if (start + PassiveBlockSize > 32000)
+        // Windows reserves ranges below the ephemeral range for Hyper-V and Docker, differently per
+        // boot; a block with a port nobody may bind would refuse every PASV, so it is skipped.
+        do
         {
-            throw new InvalidOperationException("Ran out of reserved passive port blocks for tests.");
+            var block = Interlocked.Increment(ref _passiveBlock);
+            start = PassiveBase + (block * PassiveBlockSize);
+
+            if (start + PassiveBlockSize > 32000)
+            {
+                throw new InvalidOperationException("Ran out of reserved passive port blocks for tests.");
+            }
         }
+        while (!CanBind(start, start + PassiveBlockSize - 1));
 
         using var control = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
         control.Bind(new IPEndPoint(IPAddress.Loopback, 0));
 
         return (((IPEndPoint)control.LocalEndPoint!).Port, start, start + PassiveBlockSize - 1);
+    }
+
+    private static bool CanBind(int start, int end)
+    {
+        for (var port = start; port <= end; port++)
+        {
+            try
+            {
+                using var socket = new Socket(AddressFamily.InterNetworkV6, SocketType.Stream, ProtocolType.Tcp);
+                socket.DualMode = true;
+                socket.Bind(new IPEndPoint(IPAddress.IPv6Any, port));
+            }
+            catch (SocketException)
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     public string WriteFile(string relativePath, string content)
