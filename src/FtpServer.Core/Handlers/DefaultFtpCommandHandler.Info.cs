@@ -3,6 +3,7 @@ using System.Net;
 using System.Net.Sockets;
 using FtpServer.Extensions;
 using FtpServer.IO;
+using Microsoft.Extensions.DependencyInjection;
 using Zio;
 
 namespace FtpServer.Handlers;
@@ -110,7 +111,15 @@ public partial class DefaultFtpCommandHandler
 
         if (features.Site)
         {
-            lines.Add(" SITE " + string.Join(';', SiteCommands()));
+            lines.Add(" SITE " + string.Join(';', SiteCommands(session)));
+        }
+
+        foreach (var provider in session.RootServiceProvider.GetServices<IFtpFeatureProvider>())
+        {
+            foreach (var feature in provider.GetFeatures(session))
+            {
+                lines.Add(" " + feature);
+            }
         }
 
         return session.WriteMultilineAsync("211", lines, "End", token);
@@ -529,7 +538,7 @@ public partial class DefaultFtpCommandHandler
         switch (verb)
         {
             case "HELP":
-                return session.WriteMultilineAsync("214", ["The following SITE commands are recognized:", " " + string.Join(' ', SiteCommands())], "Help OK.", token);
+                return session.WriteMultilineAsync("214", ["The following SITE commands are recognized:", " " + string.Join(' ', SiteCommands(session))], "Help OK.", token);
 
             case "CHMOD":
                 return SiteChmodAsync(session, argument, token);
@@ -541,12 +550,33 @@ public partial class DefaultFtpCommandHandler
                 return SiteUtimeAsync(session, argument, token);
 
             default:
-                return session.WriteAsync("504 Command not implemented for that parameter.\r\n"u8, token);
+                return HostSiteCommandAsync(session, verb, argument, token);
         }
     }
 
+    /// <summary>A SITE sub-command the host registered, for a session that is logged in.</summary>
+    private static ValueTask HostSiteCommandAsync(FtpSession session, string verb, string argument, CancellationToken token)
+    {
+        var command = HostSiteCommands(session).FirstOrDefault(x => string.Equals(x.Name, verb, StringComparison.OrdinalIgnoreCase));
+
+        if (command is null)
+        {
+            return session.WriteAsync("504 Command not implemented for that parameter.\r\n"u8, token);
+        }
+
+        if (TryRejectAnonymous(session, FtpCommand.SiteSpecificCommands, out var rejected))
+        {
+            return rejected;
+        }
+
+        return command.ExecuteAsync(session, argument, token);
+    }
+
+    private static IEnumerable<IFtpSiteCommand> HostSiteCommands(FtpSession session) =>
+        session.RootServiceProvider.GetServices<IFtpSiteCommand>();
+
     /// <summary>The SITE sub-commands on offer, as FEAT and SITE HELP list them.</summary>
-    private IEnumerable<string> SiteCommands()
+    private IEnumerable<string> SiteCommands(FtpSession session)
     {
         yield return "CHMOD";
         yield return "HELP";
@@ -557,6 +587,11 @@ public partial class DefaultFtpCommandHandler
         }
 
         yield return "UTIME";
+
+        foreach (var command in HostSiteCommands(session))
+        {
+            yield return command.Name.ToUpperInvariant();
+        }
     }
 
     private ValueTask SiteChmodAsync(FtpSession session, string argument, CancellationToken token)
