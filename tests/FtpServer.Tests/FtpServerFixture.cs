@@ -88,7 +88,7 @@ public sealed class FtpServerFixture : IAsyncDisposable
     /// probing at the same moment get adjacent ephemeral ports and claim overlapping ranges.
     /// A monotonic counter gives disjoint ranges by construction.
     /// </remarks>
-    private static (int Control, int PassiveStart, int PassiveEnd) ReservePorts()
+    internal static (int Control, int PassiveStart, int PassiveEnd) ReservePorts()
     {
         int start;
 

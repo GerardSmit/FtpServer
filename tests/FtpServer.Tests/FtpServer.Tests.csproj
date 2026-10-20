@@ -17,6 +17,8 @@
         <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
         <PackageReference Include="xunit.v3" Version="3.1.0" />
         <PackageReference Include="xunit.runner.visualstudio" Version="3.1.4" />
+        <!-- A real client for the relay tests. -->
+        <PackageReference Include="FluentFTP" Version="54.2.0" />
     </ItemGroup>
 
     <ItemGroup>
@@ -30,6 +32,8 @@
         <ProjectReference Include="..\..\src\FtpServer.Kestrel\FtpServer.Kestrel.csproj" />
         <!-- The management CLI edits the settings file the server reads, so it is tested too. -->
         <ProjectReference Include="..\..\src\FtpServer\FtpServer.csproj" />
+        <!-- The relay is run against a real FTPS server. -->
+        <ProjectReference Include="..\..\src\FtpServer.Relay\FtpServer.Relay.csproj" />
     </ItemGroup>
 
 </Project>
