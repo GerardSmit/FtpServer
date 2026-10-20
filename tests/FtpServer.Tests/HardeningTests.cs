@@ -784,6 +784,20 @@ public class HardeningTests
         Assert.True(FtpOptionsValidator.Validate(options, out _));
     }
 
+    [Fact]
+    public void A_list_time_zone_this_machine_does_not_know_is_refused()
+    {
+        var options = new FtpOptions();
+        options.List.TimeZone = "Nowhere/Never";
+
+        Assert.False(FtpOptionsValidator.Validate(options, out var error));
+        Assert.Contains("List.TimeZone", error, StringComparison.Ordinal);
+
+        options.List.TimeZone = "UTC";
+        Assert.True(FtpOptionsValidator.Validate(options, out _));
+        Assert.Same(TimeZoneInfo.Utc, options.List.ResolveTimeZone());
+    }
+
     // ---- OPTS UTF8 --------------------------------------------------------
 
     [Fact]

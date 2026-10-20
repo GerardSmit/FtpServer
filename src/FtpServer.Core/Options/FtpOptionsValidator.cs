@@ -77,6 +77,12 @@ public static class FtpOptionsValidator
             return false;
         }
 
+        if (!FtpListOptions.TryFindTimeZone(options.List.TimeZone, out _))
+        {
+            error = $"List.TimeZone '{options.List.TimeZone}' is not a time zone on this machine.";
+            return false;
+        }
+
         if (options.DataConnection.MinimumPort is < 0 or > 65535)
         {
             error = "DataConnection.MinimumPort must be between 0 and 65535.";

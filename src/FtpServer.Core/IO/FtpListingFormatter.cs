@@ -20,7 +20,7 @@ public sealed class FtpListingFormatter(PermissionProvider permissionProvider)
     /// <summary>Conventional placeholder size for a directory, as reported by ls on most systems.</summary>
     private const long DirectorySize = 4096;
 
-    public void AppendLongListing(StringBuilder target, IFileSystem fileSystem, FileSystemItem item, DateTimeOffset now)
+    public void AppendLongListing(StringBuilder target, IFileSystem fileSystem, FileSystemItem item, DateTimeOffset now, bool completeTimestamps = false, TimeZoneInfo? timeZone = null)
     {
         var permissions = GetPermissions(fileSystem, item);
 
@@ -37,20 +37,28 @@ public sealed class FtpListingFormatter(PermissionProvider permissionProvider)
 
         target.Append(' ').Append(GetLength(item).ToString(CultureInfo.InvariantCulture));
 
-        target.Append(' ').Append(FormatDate(item.LastWriteTime, now));
+        target.Append(' ').Append(FormatDate(item.LastWriteTime, now, completeTimestamps, timeZone));
 
         target.Append(' ').Append(SanitiseName(item.GetName()));
         target.Append("\r\n");
     }
 
     /// <summary>
-    /// Formats a timestamp the way ls does: "MMM dd HH:mm" when recent, "MMM dd  yyyy" otherwise.
+    /// Formats a timestamp the way ls does: "MMM dd HH:mm" when recent, "MMM dd  yyyy" otherwise,
+    /// and as ls -T does when <paramref name="complete"/>: "MMM dd HH:mm:ss yyyy".
     /// </summary>
-    internal static string FormatDate(DateTimeOffset timestamp, DateTimeOffset now)
+    internal static string FormatDate(DateTimeOffset timestamp, DateTimeOffset now, bool complete = false, TimeZoneInfo? timeZone = null)
     {
         // Clients interpret the listing in the server's local time.
-        var local = timestamp.ToLocalTime().DateTime;
-        var age = now.ToLocalTime().DateTime - local;
+        var zone = timeZone ?? TimeZoneInfo.Local;
+        var local = TimeZoneInfo.ConvertTime(timestamp, zone).DateTime;
+
+        if (complete)
+        {
+            return local.ToString("MMM dd HH:mm:ss yyyy", CultureInfo.InvariantCulture);
+        }
+
+        var age = TimeZoneInfo.ConvertTime(now, zone).DateTime - local;
 
         return age > RecentWindow || age < -RecentWindow
             ? local.ToString("MMM dd  yyyy", CultureInfo.InvariantCulture)

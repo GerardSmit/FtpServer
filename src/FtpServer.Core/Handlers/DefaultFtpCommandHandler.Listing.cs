@@ -23,7 +23,7 @@ public partial class DefaultFtpCommandHandler
         Machine,
     }
 
-    private readonly record struct ListingRequest(UPath Path, bool Recursive, bool IsFile);
+    private readonly record struct ListingRequest(UPath Path, bool Recursive, bool IsFile, bool CompleteTimestamps = false);
 
     public override ValueTask ListInformationAsync(FtpSession session, ReadOnlySequence<byte> data, CancellationToken token)
         => ListAsync(session, data, ListingFormat.Long, token);
@@ -127,6 +127,7 @@ public partial class DefaultFtpCommandHandler
         }
 
         var recursive = false;
+        var complete = false;
         string? pathText = null;
 
         // MLSD takes a pathname and nothing else (RFC 3659 section 7), so "MLSD -foo" lists the
@@ -146,6 +147,12 @@ public partial class DefaultFtpCommandHandler
                     if (token.Contains('R') || token.Contains('r'))
                     {
                         recursive = true;
+                    }
+
+                    // ls -T: complete timestamps. Lower-case t sorts by time, which is presentation.
+                    if (token.Contains('T'))
+                    {
+                        complete = true;
                     }
 
                     // Every other ls flag (-a, -l, -t, ...) affects presentation only.
@@ -174,7 +181,7 @@ public partial class DefaultFtpCommandHandler
         // "LIST somefile" is legal and lists just that entry.
         var isFile = format != ListingFormat.Machine && session.FileSystem.FileExists(path);
 
-        request = new ListingRequest(path, recursive, isFile);
+        request = new ListingRequest(path, recursive, isFile, format == ListingFormat.Long && complete);
         return true;
     }
 
@@ -291,7 +298,7 @@ public partial class DefaultFtpCommandHandler
                     break;
 
                 default:
-                    listingFormatter.AppendLongListing(target, session.FileSystem, item, reference);
+                    listingFormatter.AppendLongListing(target, session.FileSystem, item, reference, request.CompleteTimestamps, options.Current.List.ResolveTimeZone());
                     break;
             }
         }
@@ -508,7 +515,7 @@ public partial class DefaultFtpCommandHandler
 
         if (request.IsFile)
         {
-            listingFormatter.AppendLongListing(builder, session.FileSystem, ToItem(session, request.Path, isDirectory: false), now);
+            listingFormatter.AppendLongListing(builder, session.FileSystem, ToItem(session, request.Path, isDirectory: false), now, timeZone: options.Current.List.ResolveTimeZone());
         }
         else
         {
@@ -521,7 +528,7 @@ public partial class DefaultFtpCommandHandler
                     break;
                 }
 
-                listingFormatter.AppendLongListing(builder, session.FileSystem, item, now);
+                listingFormatter.AppendLongListing(builder, session.FileSystem, item, now, timeZone: options.Current.List.ResolveTimeZone());
             }
         }
 

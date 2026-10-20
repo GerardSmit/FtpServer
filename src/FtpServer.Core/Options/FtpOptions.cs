@@ -359,4 +359,55 @@ public class FtpListOptions
     /// Total entries a single LIST may emit. Bounds memory for a deep or wide tree.
     /// </summary>
     public int MaxEntries { get; set; } = 100_000;
+
+    /// <summary>
+    /// The id of the time zone LIST times are written in, such as "UTC" or "Europe/Amsterdam";
+    /// empty is this machine's. MLSx and MDTM are always UTC. A client that converts LIST times
+    /// needs to know the zone, which a fixed one such as UTC tells it regardless of where the
+    /// server runs.
+    /// </summary>
+    public string? TimeZone { get; set; }
+
+    // One reference, so a listing on another thread never sees half of it.
+    private ResolvedZone? _resolved;
+
+    /// <summary>The zone <see cref="TimeZone"/> names; this machine's when it is empty.</summary>
+    public TimeZoneInfo ResolveTimeZone()
+    {
+        if (_resolved is { } resolved && resolved.Id == TimeZone)
+        {
+            return resolved.Zone;
+        }
+
+        var zone = TryFindTimeZone(TimeZone, out var found) ? found : TimeZoneInfo.Local;
+        _resolved = new ResolvedZone(TimeZone, zone);
+        return zone;
+    }
+
+    internal static bool TryFindTimeZone(string? id, out TimeZoneInfo zone)
+    {
+        if (string.IsNullOrWhiteSpace(id))
+        {
+            zone = TimeZoneInfo.Local;
+            return true;
+        }
+
+        // UTC needs no time zone data, which a slim container image may not have.
+        if (string.Equals(id, "UTC", StringComparison.OrdinalIgnoreCase))
+        {
+            zone = TimeZoneInfo.Utc;
+            return true;
+        }
+
+        if (TimeZoneInfo.TryFindSystemTimeZoneById(id, out var found))
+        {
+            zone = found;
+            return true;
+        }
+
+        zone = TimeZoneInfo.Local;
+        return false;
+    }
+
+    private sealed record ResolvedZone(string? Id, TimeZoneInfo Zone);
 }
