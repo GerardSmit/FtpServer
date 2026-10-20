@@ -46,6 +46,7 @@ internal sealed class RelayServer(IOptions<RelayOptions> options, ILoggerFactory
         _listening.TrySetResult();
 
         var ports = new PassivePorts(address, relay.PassivePortStart, relay.PassivePortEnd);
+        var failures = new DirectFailures(TimeProvider.System);
         var sessionLogger = loggers.CreateLogger<RelaySession>();
 
         _logger.LogInformation("Relaying FTP on {Address}:{Port} to {Host}:{Upstream} over TLS",
@@ -70,7 +71,7 @@ internal sealed class RelayServer(IOptions<RelayOptions> options, ILoggerFactory
 
                 client.NoDelay = true;
 
-                var session = Task.Run(() => new RelaySession(client, relay, ports, sessionLogger).RunAsync(stoppingToken), CancellationToken.None);
+                var session = Task.Run(() => new RelaySession(client, relay, ports, failures, sessionLogger).RunAsync(stoppingToken), CancellationToken.None);
                 _sessions[session] = true;
                 _ = session.ContinueWith(done => _sessions.TryRemove(done, out _), TaskScheduler.Default);
             }

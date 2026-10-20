@@ -40,7 +40,8 @@ internal static class Rewrites
             return reply;
         }
 
-        var hidden = offerMlsd ? new[] { "AUTH", "PBSZ", "PROT", "CCC" } : ["AUTH", "PBSZ", "PROT", "CCC", "MLSD", "MLST"];
+        // DIRECT is for the relay itself: a client cannot use it.
+        var hidden = offerMlsd ? new[] { "AUTH", "PBSZ", "PROT", "CCC", "DIRECT" } : ["AUTH", "PBSZ", "PROT", "CCC", "DIRECT", "MLSD", "MLST"];
 
         return new FtpReply(reply.Lines.Where(line =>
         {

@@ -19,6 +19,16 @@ Plain FTP only travels between the client and the relay. By default the relay li
   only when they cannot.
 - `LIST` is sent with `-T`, so every time has seconds and a year, and the times are converted from
   the server's zone (`Upstream:ListTimeZone`) to the one the client expects (`ListTimeZone`).
+- `RETR` and `STOR` go directly when the server offers `DIRECT` in FEAT: the relay first sends
+  `SITE DIRECT RETR <path>` (or `STOR`), and a server that grants it answers
+  `200 direct://<address>[,<address>…]:<port>/<token>?sha256=<certificate fingerprint>`, naming the
+  machine that holds the file. The relay connects to whichever address answers first, over TLS with
+  that certificate pinned, sends the token on a line of its own and moves the file between that
+  machine and the client. A download is answered `OK <length>` and that many bytes; an upload is
+  answered `OK`, sent in frames of a 4-byte big-endian length and that many bytes ended by an empty
+  frame, and confirmed `OK <length>`; a refusal is `ERR <message>`. A refused grant, an address that
+  does not answer (skipped for ten minutes after that) or a refusal before the transfer starts sends
+  the file through the server as usual, with any `REST` given again.
 
 ## Build
 
@@ -40,6 +50,9 @@ This gives a NativeAOT `C:\FtpRelay\FtpRelay.exe` (about 5 MB, no .NET runtime n
 | `PassivePortStart`, `PassivePortEnd` | `50300`–`50349` | Open them in the firewall when serving the network. |
 | `OfferMlsd` | `false` | |
 | `ListTimeZone` | `Standard` | The zone the client gets LIST times in: `Standard` (this machine's zone without daylight saving time, as clients that convert LIST times with the standard offset all year read them), `Local`, or a time zone id such as `UTC`. |
+| `Direct` | `true` | Ask for direct transfers when the server offers them. |
+| `DirectConnectTimeout` | `00:00:02` | How long a direct connection may take before the transfer goes through the server. |
+| `DirectAnswerTimeout` | `00:00:30` | How long the other machine may take to answer, including writing an upload. |
 | `Upstream:Host`, `Upstream:Port` | required, `21` | The FTPS server. |
 | `Upstream:CertificateThumbprint` | empty | Accept this certificate although it does not validate (a test server's self-signed one). Empty accepts only certificates valid for the host. |
 | `Upstream:ListTimeZone` | `UTC` | The zone the server writes LIST times in. |

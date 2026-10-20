@@ -31,6 +31,19 @@ public sealed class RelayOptions
     /// </summary>
     public string ListTimeZone { get; set; } = "Standard";
 
+    /// <summary>
+    /// Ask a server that offers DIRECT for a direct transfer before each RETR and STOR, so the file goes
+    /// straight between the machine that holds it and the client. Whatever cannot be done directly goes
+    /// through the server as usual.
+    /// </summary>
+    public bool Direct { get; set; } = true;
+
+    /// <summary>How long a direct connection may take before the transfer goes through the server.</summary>
+    public TimeSpan DirectConnectTimeout { get; set; } = TimeSpan.FromSeconds(2);
+
+    /// <summary>How long the machine may take to answer, which includes writing an upload to its end.</summary>
+    public TimeSpan DirectAnswerTimeout { get; set; } = TimeSpan.FromSeconds(30);
+
     public UpstreamOptions Upstream { get; set; } = new();
 }
 

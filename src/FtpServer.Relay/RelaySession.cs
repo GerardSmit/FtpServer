@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Globalization;
 using System.Net;
 using System.Net.Security;
@@ -14,7 +15,7 @@ namespace FtpServer.Relay;
 /// they are. Only what a plain client and a TLS server see differently is handled here: TLS commands,
 /// HOST, the data connections, and the features and listings described in <see cref="Rewrites"/>.
 /// </summary>
-internal sealed class RelaySession(TcpClient client, RelayOptions options, PassivePorts ports, ILogger logger)
+internal sealed class RelaySession(TcpClient client, RelayOptions options, PassivePorts ports, DirectFailures failures, ILogger logger)
 {
     private static readonly HashSet<string> Transfers = new(StringComparer.Ordinal) { "LIST", "NLST", "MLSD", "RETR", "STOR", "STOU", "APPE" };
     private static readonly HashSet<string> Uploads = new(StringComparer.Ordinal) { "STOR", "STOU", "APPE" };
@@ -29,6 +30,13 @@ internal sealed class RelaySession(TcpClient client, RelayOptions options, Passi
     private IPAddress _clientAddress = IPAddress.None;
     private ClientData? _data;
     private string? _user;
+
+    // The server offers DIRECT: RETR and STOR are first asked for as a direct transfer.
+    private bool _direct;
+
+    // The offset of the last accepted REST, which the server takes for a direct transfer it grants
+    // and has to be given again when the relay then falls back to RETR or STOR.
+    private long _restart;
 
     public async Task RunAsync(CancellationToken token)
     {
@@ -184,15 +192,38 @@ internal sealed class RelaySession(TcpClient client, RelayOptions options, Passi
                 return await ForwardAsync(line, token);
 
             case "PASS":
-                return await ForwardAsync(line, token, reply =>
+                var loggedIn = false;
+
+                var open = await ForwardAsync(line, token, reply =>
                 {
                     if (reply.Code == "230")
                     {
+                        loggedIn = true;
                         logger.LogInformation("{User} from {Client} logged in at {Host}", _user, _clientAddress, options.Upstream.Host);
                     }
                     else if (reply.Code == "530")
                     {
                         logger.LogWarning("{User} from {Client} was refused by {Host}", _user, _clientAddress, options.Upstream.Host);
+                    }
+
+                    return reply;
+                });
+
+                if (open && loggedIn && options.Direct)
+                {
+                    _direct = await OffersDirectAsync(token);
+                }
+
+                return open;
+
+            case "REST":
+                _restart = 0;
+
+                return await ForwardAsync(line, token, reply =>
+                {
+                    if (reply.Code == "350" && long.TryParse(argument.Trim(), NumberStyles.None, CultureInfo.InvariantCulture, out var offset))
+                    {
+                        _restart = offset;
                     }
 
                     return reply;
@@ -373,6 +404,18 @@ internal sealed class RelaySession(TcpClient client, RelayOptions options, Passi
                 return false;
             }
 
+            if (_direct && verb is "RETR" or "STOR")
+            {
+                if (await DirectAsync(verb, argument, clientData, token) is { } handled)
+                {
+                    _restart = 0;
+                    return handled;
+                }
+            }
+
+            // Any transfer uses up a REST, on the server as here.
+            _restart = 0;
+
             TcpClient upstreamData;
 
             try
@@ -472,6 +515,154 @@ internal sealed class RelaySession(TcpClient client, RelayOptions options, Passi
             await _client.WriteReplyAsync(final, token);
             return final.Code != "421";
         }
+    }
+
+    /// <summary>Whether the server lists DIRECT among its features, asked once after the login.</summary>
+    private async Task<bool> OffersDirectAsync(CancellationToken token)
+    {
+        if (!await DrainUnsolicitedAsync(token) || await _upstream.CommandAsync("FEAT", token) is not { Code: "211" } features)
+        {
+            return false;
+        }
+
+        return features.Lines.Any(x => Encoding.UTF8.GetString(x).Trim().Equals("DIRECT", StringComparison.OrdinalIgnoreCase));
+    }
+
+    /// <summary>
+    /// RETR or STOR as a direct transfer: SITE DIRECT asks the server where the file is, and the bytes
+    /// go straight between that machine and the client. Null when it is not on offer for this file or
+    /// the machine cannot be reached, after which the caller does the transfer through the server.
+    /// </summary>
+    private async Task<bool?> DirectAsync(string verb, string argument, ClientData clientData, CancellationToken token)
+    {
+        if (await _upstream.CommandAsync($"SITE DIRECT {verb} {argument}", token) is not { } reply)
+        {
+            await LostAsync(token);
+            return false;
+        }
+
+        // Refused (an ASCII transfer, a file it does not know, a machine without direct transfers):
+        // the server left everything as it was, REST included.
+        if (reply.Code != "200" || !DirectTarget.TryParse(reply.Text, out var target))
+        {
+            return null;
+        }
+
+        if (failures.IsFailing(target))
+        {
+            return await RestoreRestartAsync(token) ? null : false;
+        }
+
+        DirectConnection direct;
+        long? length;
+
+        try
+        {
+            direct = await DirectConnection.OpenAsync(target, options.DirectConnectTimeout, token);
+        }
+        catch (Exception ex) when (ex is IOException or SocketException or AuthenticationException || (ex is OperationCanceledException && !token.IsCancellationRequested))
+        {
+            failures.Fail(target);
+            logger.LogWarning("Direct transfers to {Target} are skipped for {Minutes} minutes: {Error}", target.Key, DirectFailures.Duration.TotalMinutes, ex.Message);
+            return await RestoreRestartAsync(token) ? null : false;
+        }
+
+        await using (direct)
+        {
+            try
+            {
+                length = await direct.ReadStartAsync(options.DirectAnswerTimeout, token);
+            }
+            catch (Exception ex) when (ex is IOException or SocketException || (ex is OperationCanceledException && !token.IsCancellationRequested))
+            {
+                logger.LogWarning("A direct {Verb} of {Path} for {User} was refused, so it goes through the server: {Error}", verb, argument, _user, ex.Message);
+                return await RestoreRestartAsync(token) ? null : false;
+            }
+
+            failures.Succeed(target);
+
+            await ReplyAsync("150 Opening data connection.", token);
+
+            TcpClient clientConnection;
+
+            try
+            {
+                clientConnection = await clientData.OpenAsync(token);
+            }
+            catch (Exception ex) when (ex is IOException or SocketException || (ex is OperationCanceledException && !token.IsCancellationRequested))
+            {
+                await ReplyAsync("425 Cannot open data connection.", token);
+                return true;
+            }
+
+            using (clientConnection)
+            {
+                var clientStream = clientConnection.GetStream();
+                var stopwatch = Stopwatch.StartNew();
+                using var transfer = CancellationTokenSource.CreateLinkedTokenSource(token);
+
+                var pump = verb == "STOR"
+                    ? direct.UploadAsync(clientStream, options.DirectAnswerTimeout, transfer.Token)
+                    : DownloadAsync(direct, clientConnection, length ?? 0, transfer.Token);
+
+                if (await AbortRequestedAsync(pump, token))
+                {
+                    await transfer.CancelAsync();
+                    await direct.DisposeAsync();
+                    clientConnection.Dispose();
+                    await ObserveAsync(pump);
+                    await ReplyAsync("426 Connection closed; transfer aborted.", token);
+                    await ReplyAsync("226 Abort successful.", token);
+                    return true;
+                }
+
+                try
+                {
+                    var bytes = await pump;
+                    var seconds = Math.Max(stopwatch.Elapsed.TotalSeconds, 0.001);
+
+                    logger.LogInformation("{User} {Verb} {Path} directly at {Address}: {Bytes} bytes in {Seconds:0.0} s ({Rate:0.0} MB/s)",
+                        _user, verb, argument, direct.Address, bytes, seconds, bytes / seconds / 1_000_000);
+
+                    await ReplyAsync("226 Transfer complete.", token);
+                }
+                catch (DirectRefusedException ex)
+                {
+                    await ReplyAsync($"451 {ex.Message}", token);
+                }
+                catch (Exception ex) when (ex is IOException or SocketException or ObjectDisposedException or OperationCanceledException or AuthenticationException)
+                {
+                    logger.LogWarning("A direct {Verb} of {Path} for {User} broke off: {Error}", verb, argument, _user, ex.Message);
+                    await ReplyAsync("426 Connection closed; transfer aborted.", token);
+                }
+            }
+
+            return true;
+        }
+    }
+
+    private static async Task<long> DownloadAsync(DirectConnection direct, TcpClient clientConnection, long length, CancellationToken token)
+    {
+        var bytes = await direct.DownloadAsync(clientConnection.GetStream(), length, token);
+        clientConnection.Client.Shutdown(SocketShutdown.Send);
+        return bytes;
+    }
+
+    /// <summary>Gives the server the REST it took for a direct transfer the relay did not make; false when the server is gone.</summary>
+    private async Task<bool> RestoreRestartAsync(CancellationToken token)
+    {
+        if (_restart <= 0)
+        {
+            return true;
+        }
+
+        if (await _upstream.CommandAsync($"REST {_restart.ToString(CultureInfo.InvariantCulture)}", token) is not { } reply)
+        {
+            await LostAsync(token);
+            return false;
+        }
+
+        return true;
     }
 
     private async Task PumpAsync(string verb, SslStream serverData, TcpClient clientConnection, CancellationToken token)
