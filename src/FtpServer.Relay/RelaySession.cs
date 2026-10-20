@@ -68,7 +68,7 @@ internal sealed class RelaySession(TcpClient client, RelayOptions options, Passi
         catch (Exception ex) when (ex is IOException or SocketException or AuthenticationException ||
                                    (ex is OperationCanceledException && !token.IsCancellationRequested))
         {
-            logger.LogDebug(ex, "Relaying for {Client} ended", remote);
+            logger.LogWarning("Relaying for {User} from {Client} ended: {Error}", _user, remote, ex.Message);
         }
         finally
         {
@@ -234,12 +234,19 @@ internal sealed class RelaySession(TcpClient client, RelayOptions options, Passi
 
         if (await _upstream.ReplyAsync(token) is not { } reply)
         {
-            await ReplyAsync("421 The connection to the FTPS server was lost.", token);
+            await LostAsync(token);
             return false;
         }
 
         await _client.WriteReplyAsync(change?.Invoke(reply) ?? reply, token);
         return reply.Code != "421";
+    }
+
+    /// <summary>The server closed the connection or did not answer in time: said in the log, and to the client.</summary>
+    private async Task LostAsync(CancellationToken token)
+    {
+        logger.LogWarning("The connection to {Host} of {User} from {Client} was lost or did not answer in time", options.Upstream.Host, _user, _clientAddress);
+        await ReplyAsync("421 The connection to the FTPS server was lost.", token);
     }
 
     /// <summary>
@@ -252,9 +259,16 @@ internal sealed class RelaySession(TcpClient client, RelayOptions options, Passi
         {
             var stale = await _upstream.ReplyAsync(token, TimeSpan.FromSeconds(2));
 
-            if (stale is null || stale.Code == "421")
+            if (stale is null)
             {
-                await ReplyAsync(stale is null ? "421 The connection to the FTPS server was lost." : Encoding.UTF8.GetString(stale.Lines[^1]), token);
+                await LostAsync(token);
+                return false;
+            }
+
+            if (stale.Code == "421")
+            {
+                logger.LogInformation("{Host} closed the connection of {User} from {Client}: {Reply}", options.Upstream.Host, _user, _clientAddress, stale.Text);
+                await ReplyAsync(Encoding.UTF8.GetString(stale.Lines[^1]), token);
                 return false;
             }
         }
@@ -386,7 +400,7 @@ internal sealed class RelaySession(TcpClient client, RelayOptions options, Passi
 
                 if (await _upstream.ReplyAsync(token) is not { } start)
                 {
-                    await ReplyAsync("421 The connection to the FTPS server was lost.", token);
+                    await LostAsync(token);
                     return false;
                 }
 
@@ -451,7 +465,7 @@ internal sealed class RelaySession(TcpClient client, RelayOptions options, Passi
 
             if (await _upstream.ReplyAsync(token) is not { } final)
             {
-                await ReplyAsync("421 The connection to the FTPS server was lost.", token);
+                await LostAsync(token);
                 return false;
             }
 
@@ -540,7 +554,7 @@ internal sealed class RelaySession(TcpClient client, RelayOptions options, Passi
 
         if (await _upstream.ReplyAsync(token) is not { } first)
         {
-            await ReplyAsync("421 The connection to the FTPS server was lost.", token);
+            await LostAsync(token);
             return false;
         }
 
@@ -560,7 +574,7 @@ internal sealed class RelaySession(TcpClient client, RelayOptions options, Passi
     {
         if (await _upstream.ReplyAsync(token) is null)
         {
-            await ReplyAsync("421 The connection to the FTPS server was lost.", token);
+            await LostAsync(token);
             return false;
         }
 
