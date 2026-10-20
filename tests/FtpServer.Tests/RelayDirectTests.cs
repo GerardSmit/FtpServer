@@ -66,6 +66,11 @@ public sealed class RelayDirectTests : IAsyncLifetime
 
     private bool RefuseDirect { get; set; }
 
+    /// <summary>The tokens of the uploads the relay said were done, and what the server answers that.</summary>
+    private ConcurrentBag<string> Done { get; } = [];
+
+    private string DoneReply { get; set; } = "200 Written.";
+
     private async Task<FtpTestClient> ConnectAsync()
     {
         var thumbprint = _upstream.Services.GetRequiredService<CertificateProvider>().GetCertificate().Thumbprint;
@@ -133,6 +138,19 @@ public sealed class RelayDirectTests : IAsyncLifetime
         Assert.Contains("226", control);
         Assert.Equal("hello", File.ReadAllText(Upstream("site/new.txt")));
         Assert.Equal(1, _direct.Served);
+        Assert.Single(Done);
+    }
+
+    [Fact]
+    public async Task An_upload_the_server_did_not_take_is_not_reported_complete()
+    {
+        DoneReply = "451 Disk full.";
+        await using var client = await ConnectAsync();
+
+        var control = await client.UploadAsync("STOR /site/new.txt", "hello"u8.ToArray());
+
+        Assert.Contains("451 Disk full.", control);
+        Assert.DoesNotContain("226", control);
     }
 
     [Fact]
@@ -206,6 +224,12 @@ public sealed class RelayDirectTests : IAsyncLifetime
         public ValueTask ExecuteAsync(FtpSession session, string argument, CancellationToken token)
         {
             var space = argument.IndexOf(' ');
+
+            if (argument.StartsWith("DONE ", StringComparison.OrdinalIgnoreCase))
+            {
+                test.Done.Add(argument[5..]);
+                return session.WriteAsync($"{test.DoneReply}\r\n", token);
+            }
 
             if (test.RefuseDirect || space < 0 ||
                 !SequenceExtensions.TryResolvePath(argument[(space + 1)..], session.CurrentDirectory, out var path))

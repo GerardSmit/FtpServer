@@ -624,6 +624,23 @@ internal sealed class RelaySession(TcpClient client, RelayOptions options, Passi
                     logger.LogInformation("{User} {Verb} {Path} directly at {Address}: {Bytes} bytes in {Seconds:0.0} s ({Rate:0.0} MB/s)",
                         _user, verb, argument, direct.Address, bytes, seconds, bytes / seconds / 1_000_000);
 
+                    // The server learns of an upload from the machine that wrote it; until it has, a client that
+                    // goes on at once would not find the file. A server that does not know DONE answers 5xx.
+                    if (verb == "STOR")
+                    {
+                        if (await _upstream.CommandAsync($"SITE DIRECT DONE {target.Token}", token) is not { } done)
+                        {
+                            await LostAsync(token);
+                            return false;
+                        }
+
+                        if (done.Code.StartsWith('4'))
+                        {
+                            await ReplyAsync($"451 {done.Text}", token);
+                            return true;
+                        }
+                    }
+
                     await ReplyAsync("226 Transfer complete.", token);
                 }
                 catch (DirectRefusedException ex)
@@ -675,6 +692,10 @@ internal sealed class RelaySession(TcpClient client, RelayOptions options, Passi
 
             // close_notify: the server takes the end of the upload as the end of the file, not as a cut.
             await serverData.ShutdownAsync();
+
+            // Then wait for the server to close its side: closing while what it sent (a TLS session ticket) is
+            // still unread here resets the connection, and the server may lose the end of the file to that.
+            await DrainAsync(serverData, token);
             return;
         }
 
@@ -688,6 +709,24 @@ internal sealed class RelaySession(TcpClient client, RelayOptions options, Passi
         }
 
         clientConnection.Client.Shutdown(SocketShutdown.Send);
+    }
+
+    private static async Task DrainAsync(SslStream serverData, CancellationToken token)
+    {
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token);
+        timeout.CancelAfter(TimeSpan.FromSeconds(30));
+        var buffer = new byte[4096];
+
+        try
+        {
+            while (await serverData.ReadAsync(buffer, timeout.Token) > 0)
+            {
+            }
+        }
+        catch (Exception ex) when (ex is IOException || (ex is OperationCanceledException && !token.IsCancellationRequested))
+        {
+            // Closed without close_notify, or not at all: the server's reply says how the upload went.
+        }
     }
 
     /// <summary>True when the pump ran to its end; false when a data connection failed.</summary>
