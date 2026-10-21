@@ -34,6 +34,7 @@
         <ProjectReference Include="..\..\src\FtpServer\FtpServer.csproj" />
         <!-- The relay is run against a real FTPS server. -->
         <ProjectReference Include="..\..\src\FtpServer.Relay\FtpServer.Relay.csproj" />
+        <ProjectReference Include="..\..\src\FtpServer.Direct\FtpServer.Direct.csproj" />
     </ItemGroup>
 
 </Project>

@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <TargetFramework>net10.0</TargetFramework>
+        <RootNamespace>FtpServer.Direct</RootNamespace>
+        <IsAotCompatible>true</IsAotCompatible>
+        <IsPackable>true</IsPackable>
+        <PackageId>GerardSmit.FtpServer.Direct</PackageId>
+        <Description>A reliable stream between two machines behind NAT or a firewall, by UDP hole punching (STUN and LiteNetLib), for direct transfers that run TLS over it.</Description>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <PackageReference Include="LiteNetLib" Version="2.1.4" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <InternalsVisibleTo Include="FtpServer.Tests" />
+    </ItemGroup>
+
+</Project>
