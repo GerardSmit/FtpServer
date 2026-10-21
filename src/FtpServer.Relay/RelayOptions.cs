@@ -1,3 +1,5 @@
+using FtpServer.Direct;
+
 namespace FtpServer.Relay;
 
 /// <summary>The "Relay" section of appsettings.json.</summary>
@@ -43,6 +45,18 @@ public sealed class RelayOptions
 
     /// <summary>How long the machine may take to answer, which includes writing an upload to its end.</summary>
     public TimeSpan DirectAnswerTimeout { get; set; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>
+    /// When the machine cannot be reached over TCP, punch through both sides' NAT and firewall over UDP,
+    /// with the server passing on where each side can be reached.
+    /// </summary>
+    public bool DirectUdp { get; set; } = true;
+
+    /// <summary>How long punching through and the TLS handshake over UDP may take.</summary>
+    public TimeSpan DirectUdpTimeout { get; set; } = TimeSpan.FromSeconds(5);
+
+    /// <summary>The STUN servers that tell the relay its public address, as host:port.</summary>
+    public string[] StunServers { get; set; } = [.. UdpTunnelOptions.DefaultStunServers];
 
     public UpstreamOptions Upstream { get; set; } = new();
 }

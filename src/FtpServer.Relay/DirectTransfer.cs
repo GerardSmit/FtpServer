@@ -6,6 +6,7 @@ using System.Globalization;
 using System.Net.Security;
 using System.Net.Sockets;
 using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
 using System.Text;
 
 namespace FtpServer.Relay;
@@ -87,6 +88,37 @@ internal sealed record DirectTarget(IReadOnlyList<string> Addresses, int Port, s
 }
 
 /// <summary>
+/// The key pair the relay shows the machines it transfers with directly, made anew at every start. The
+/// server is told its fingerprint over the FTPS connection (SITE DIRECT KEY), and a machine only serves a
+/// grant to the key the server named, so a token that leaks is of no use to anyone else.
+/// </summary>
+internal sealed class DirectIdentity : IDisposable
+{
+    private DirectIdentity(X509Certificate2 certificate)
+    {
+        Certificate = certificate;
+        Fingerprint = Convert.ToHexStringLower(certificate.GetCertHash(HashAlgorithmName.SHA256));
+    }
+
+    public X509Certificate2 Certificate { get; }
+
+    /// <summary>SHA-256 of the certificate, in hex.</summary>
+    public string Fingerprint { get; }
+
+    public static DirectIdentity Create()
+    {
+        using var key = ECDsa.Create(ECCurve.NamedCurves.nistP256);
+        var request = new CertificateRequest("CN=ftp-relay", key, HashAlgorithmName.SHA256);
+        using var created = request.CreateSelfSigned(DateTimeOffset.UtcNow.AddDays(-1), DateTimeOffset.UtcNow.AddYears(10));
+
+        // Through PKCS#12: on Windows, TLS only presents a certificate whose key is not ephemeral.
+        return new DirectIdentity(X509CertificateLoader.LoadPkcs12(created.Export(X509ContentType.Pkcs12), null));
+    }
+
+    public void Dispose() => Certificate.Dispose();
+}
+
+/// <summary>
 /// One direct transfer. The client sends the token on a line of its own; the other side answers
 /// <c>OK length</c> and sends that many bytes (a download), or <c>OK</c> and takes the file in frames
 /// of a 4-byte big-endian length and that many bytes, ended by an empty frame, after which it answers
@@ -96,50 +128,60 @@ internal sealed class DirectConnection : IAsyncDisposable
 {
     private const int MaxFrame = 1024 * 1024;
 
-    private readonly TcpClient _tcp;
     private readonly SslStream _tls;
 
-    private DirectConnection(TcpClient tcp, SslStream tls, string address)
+    private DirectConnection(SslStream tls, string address)
     {
-        _tcp = tcp;
         _tls = tls;
         Address = address;
     }
 
-    /// <summary>The address that answered first.</summary>
+    /// <summary>The address that answered first, or how the connection was made.</summary>
     public string Address { get; }
 
     /// <summary>
-    /// Connects to whichever address answers first within <paramref name="connectTimeout"/>, checks the
-    /// certificate against the fingerprint and sends the token. Throws when none could be reached.
+    /// Connects to whichever address answers first within <paramref name="connectTimeout"/>, then as
+    /// <see cref="SecureAsync"/>. Throws when none could be reached.
     /// </summary>
-    public static async Task<DirectConnection> OpenAsync(DirectTarget target, TimeSpan connectTimeout, CancellationToken token)
+    public static async Task<DirectConnection> OpenAsync(DirectTarget target, DirectIdentity identity, TimeSpan connectTimeout, CancellationToken token)
     {
         using var connecting = CancellationTokenSource.CreateLinkedTokenSource(token);
         connecting.CancelAfter(connectTimeout);
 
         var (tcp, address) = await ConnectFirstAsync(target, connecting.Token);
+        return await SecureAsync(tcp.GetStream(), address, target, identity, connectTimeout, token);
+    }
+
+    /// <summary>
+    /// TLS over <paramref name="stream"/>, which it then owns: the machine's certificate is checked
+    /// against the target's fingerprint, the relay shows its own, and the token is sent.
+    /// </summary>
+    public static async Task<DirectConnection> SecureAsync(Stream stream, string address, DirectTarget target, DirectIdentity identity, TimeSpan timeout, CancellationToken token)
+    {
+        var tls = new SslStream(stream, leaveInnerStreamOpen: false);
 
         try
         {
-            var tls = new SslStream(tcp.GetStream(), leaveInnerStreamOpen: false);
+            using var handshake = CancellationTokenSource.CreateLinkedTokenSource(token);
+            handshake.CancelAfter(timeout);
 
             await tls.AuthenticateAsClientAsync(new SslClientAuthenticationOptions
             {
                 TargetHost = "direct",
+                LocalCertificateSelectionCallback = (_, _, _, _, _) => identity.Certificate,
                 RemoteCertificateValidationCallback = (_, certificate, _, _) =>
                     certificate is not null &&
                     CryptographicOperations.FixedTimeEquals(certificate.GetCertHash(HashAlgorithmName.SHA256), target.Fingerprint)
-            }, connecting.Token);
+            }, handshake.Token);
 
             await tls.WriteAsync(Encoding.ASCII.GetBytes(target.Token + "\n"), token);
             await tls.FlushAsync(token);
 
-            return new DirectConnection(tcp, tls, address);
+            return new DirectConnection(tls, address);
         }
         catch
         {
-            tcp.Dispose();
+            await tls.DisposeAsync();
             throw;
         }
     }
@@ -314,8 +356,6 @@ internal sealed class DirectConnection : IAsyncDisposable
         catch (IOException)
         {
         }
-
-        _tcp.Dispose();
     }
 }
 
@@ -323,8 +363,8 @@ internal sealed class DirectConnection : IAsyncDisposable
 internal sealed class DirectRefusedException(string message) : IOException(message);
 
 /// <summary>
-/// Targets that could not be reached, skipped for a while, so a machine the relay cannot reach costs
-/// the wait once and not for every file.
+/// Ways to a target that did not work, skipped for a while, so a machine the relay cannot reach costs
+/// the wait once and not for every file. A way is how ("tcp:" or "udp:") followed by the target's key.
 /// </summary>
 internal sealed class DirectFailures(TimeProvider time)
 {
@@ -332,10 +372,10 @@ internal sealed class DirectFailures(TimeProvider time)
 
     private readonly ConcurrentDictionary<string, DateTimeOffset> _until = new();
 
-    public bool IsFailing(DirectTarget target) =>
-        _until.TryGetValue(target.Key, out var until) && until > time.GetUtcNow();
+    public bool IsFailing(string way) =>
+        _until.TryGetValue(way, out var until) && until > time.GetUtcNow();
 
-    public void Fail(DirectTarget target) => _until[target.Key] = time.GetUtcNow() + Duration;
+    public void Fail(string way) => _until[way] = time.GetUtcNow() + Duration;
 
-    public void Succeed(DirectTarget target) => _until.TryRemove(target.Key, out _);
+    public void Succeed(string way) => _until.TryRemove(way, out _);
 }

@@ -6,6 +6,7 @@ using System.Net.Sockets;
 using System.Security.Authentication;
 using System.Text;
 using System.Threading.Channels;
+using FtpServer.Direct;
 using Microsoft.Extensions.Logging;
 
 namespace FtpServer.Relay;
@@ -15,7 +16,7 @@ namespace FtpServer.Relay;
 /// they are. Only what a plain client and a TLS server see differently is handled here: TLS commands,
 /// HOST, the data connections, and the features and listings described in <see cref="Rewrites"/>.
 /// </summary>
-internal sealed class RelaySession(TcpClient client, RelayOptions options, PassivePorts ports, DirectFailures failures, ILogger logger)
+internal sealed class RelaySession(TcpClient client, RelayOptions options, PassivePorts ports, DirectFailures failures, DirectIdentity identity, ILogger logger)
 {
     private static readonly HashSet<string> Transfers = new(StringComparer.Ordinal) { "LIST", "NLST", "MLSD", "RETR", "STOR", "STOU", "APPE" };
     private static readonly HashSet<string> Uploads = new(StringComparer.Ordinal) { "STOR", "STOU", "APPE" };
@@ -517,15 +518,25 @@ internal sealed class RelaySession(TcpClient client, RelayOptions options, Passi
         }
     }
 
-    /// <summary>Whether the server lists DIRECT among its features, asked once after the login.</summary>
+    /// <summary>
+    /// Whether the server lists DIRECT among its features and takes the relay's key, asked once after the
+    /// login: the machines it names then serve only a connection that shows that key.
+    /// </summary>
     private async Task<bool> OffersDirectAsync(CancellationToken token)
     {
-        if (!await DrainUnsolicitedAsync(token) || await _upstream.CommandAsync("FEAT", token) is not { Code: "211" } features)
+        if (!await DrainUnsolicitedAsync(token) || await _upstream.CommandAsync("FEAT", token) is not { Code: "211" } features ||
+            !features.Lines.Any(x => Encoding.UTF8.GetString(x).Trim().Equals("DIRECT", StringComparison.OrdinalIgnoreCase)))
         {
             return false;
         }
 
-        return features.Lines.Any(x => Encoding.UTF8.GetString(x).Trim().Equals("DIRECT", StringComparison.OrdinalIgnoreCase));
+        if (await _upstream.CommandAsync($"SITE DIRECT KEY {identity.Fingerprint}", token) is not { Code: "200" })
+        {
+            logger.LogInformation("{Host} did not take the relay's key; transfers go through it", options.Upstream.Host);
+            return false;
+        }
+
+        return true;
     }
 
     /// <summary>
@@ -548,24 +559,20 @@ internal sealed class RelaySession(TcpClient client, RelayOptions options, Passi
             return null;
         }
 
-        if (failures.IsFailing(target))
+        var (direct, lost) = await ConnectDirectAsync(target, token);
+
+        if (lost)
+        {
+            await LostAsync(token);
+            return false;
+        }
+
+        if (direct is null)
         {
             return await RestoreRestartAsync(token) ? null : false;
         }
 
-        DirectConnection direct;
         long? length;
-
-        try
-        {
-            direct = await DirectConnection.OpenAsync(target, options.DirectConnectTimeout, token);
-        }
-        catch (Exception ex) when (ex is IOException or SocketException or AuthenticationException || (ex is OperationCanceledException && !token.IsCancellationRequested))
-        {
-            failures.Fail(target);
-            logger.LogWarning("Direct transfers to {Target} are skipped for {Minutes} minutes: {Error}", target.Key, DirectFailures.Duration.TotalMinutes, ex.Message);
-            return await RestoreRestartAsync(token) ? null : false;
-        }
 
         await using (direct)
         {
@@ -578,8 +585,6 @@ internal sealed class RelaySession(TcpClient client, RelayOptions options, Passi
                 logger.LogWarning("A direct {Verb} of {Path} for {User} was refused, so it goes through the server: {Error}", verb, argument, _user, ex.Message);
                 return await RestoreRestartAsync(token) ? null : false;
             }
-
-            failures.Succeed(target);
 
             await ReplyAsync("150 Opening data connection.", token);
 
@@ -657,6 +662,82 @@ internal sealed class RelaySession(TcpClient client, RelayOptions options, Passi
             return true;
         }
     }
+
+    /// <summary>
+    /// The machine over TCP at the addresses the server gave, or else over UDP, punching through both sides'
+    /// NAT and firewall with the server passing on where each side can be reached. Null when neither works;
+    /// a way that failed is skipped for a while. Lost when the server went away meanwhile.
+    /// </summary>
+    private async Task<(DirectConnection? Direct, bool Lost)> ConnectDirectAsync(DirectTarget target, CancellationToken token)
+    {
+        var tcp = "tcp:" + target.Key;
+
+        if (!failures.IsFailing(tcp))
+        {
+            try
+            {
+                var direct = await DirectConnection.OpenAsync(target, identity, options.DirectConnectTimeout, token);
+                failures.Succeed(tcp);
+                return (direct, false);
+            }
+            catch (Exception ex) when (ex is IOException or SocketException or AuthenticationException || (ex is OperationCanceledException && !token.IsCancellationRequested))
+            {
+                failures.Fail(tcp);
+                logger.LogWarning("Direct transfers to {Target} over TCP are skipped for {Minutes} minutes: {Error}", target.Key, DirectFailures.Duration.TotalMinutes, Describe(ex, options.DirectConnectTimeout));
+            }
+        }
+
+        var udp = "udp:" + target.Key;
+
+        if (!options.DirectUdp || failures.IsFailing(udp))
+        {
+            return (null, false);
+        }
+
+        UdpTunnel tunnel;
+
+        try
+        {
+            tunnel = await UdpTunnel.OpenAsync(new UdpTunnelOptions { StunServers = options.StunServers }, token);
+        }
+        catch (Exception ex) when (ex is IOException or SocketException)
+        {
+            logger.LogWarning("No UDP port for a direct transfer: {Error}", ex.Message);
+            return (null, false);
+        }
+
+        try
+        {
+            if (await _upstream.CommandAsync($"SITE DIRECT UDP {target.Token} {Candidates.Format(tunnel.Candidates)}", token) is not { } reply)
+            {
+                tunnel.Dispose();
+                return (null, true);
+            }
+
+            // "200 key candidates"; anything else is a server or machine that does not do UDP.
+            if (reply.Code != "200" || reply.Text.Split(' ', 2, StringSplitOptions.TrimEntries) is not [var key, var others] || Candidates.Parse(others) is not { Count: > 0 } peer)
+            {
+                tunnel.Dispose();
+                return (null, false);
+            }
+
+            var stream = await tunnel.ConnectAsync(peer, key, options.DirectUdpTimeout, token);
+            var connection = await DirectConnection.SecureAsync(stream, "UDP", target, identity, options.DirectUdpTimeout, token);
+            failures.Succeed(udp);
+            return (connection, false);
+        }
+        catch (Exception ex) when (ex is IOException or SocketException or AuthenticationException || (ex is OperationCanceledException && !token.IsCancellationRequested))
+        {
+            tunnel.Dispose();
+            failures.Fail(udp);
+            logger.LogWarning("Direct transfers to {Target} over UDP are skipped for {Minutes} minutes (NAT {Nat}): {Error}", target.Key, DirectFailures.Duration.TotalMinutes, tunnel.Nat, Describe(ex, options.DirectUdpTimeout));
+            return (null, false);
+        }
+    }
+
+    // A timeout surfaces as a cancellation, whose own message says nothing about what was waited for.
+    private static string Describe(Exception ex, TimeSpan timeout) =>
+        ex is OperationCanceledException ? $"no answer within {timeout.TotalSeconds:0.#} s" : ex.Message;
 
     private static async Task<long> DownloadAsync(DirectConnection direct, TcpClient clientConnection, long length, CancellationToken token)
     {

@@ -7,6 +7,7 @@ using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
+using FtpServer.Direct;
 using FtpServer.Extensions;
 using FtpServer.Handlers;
 using FtpServer.Options;
@@ -65,6 +66,18 @@ public sealed class RelayDirectTests : IAsyncLifetime
     private string DirectAddress { get; set; } = "127.0.0.1";
 
     private bool RefuseDirect { get; set; }
+
+    /// <summary>The server does not take the relay's key, as an older one would not.</summary>
+    private bool RefuseKey { get; set; }
+
+    /// <summary>The key the relay registered with SITE DIRECT KEY.</summary>
+    private string? RelayKey { get; set; }
+
+    /// <summary>The key grants are pinned to instead of the relay's, as if another client had asked.</summary>
+    private string? PinOverride { get; set; }
+
+    /// <summary>The machine can also be reached by punching through over UDP.</summary>
+    private bool OfferUdp { get; set; }
 
     /// <summary>The tokens of the uploads the relay said were done, and what the server answers that.</summary>
     private ConcurrentBag<string> Done { get; } = [];
@@ -181,6 +194,62 @@ public sealed class RelayDirectTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task The_relay_registers_its_key_and_the_machine_checks_it()
+    {
+        await using var client = await ConnectAsync();
+
+        await client.DownloadAsync("RETR /site/bin/app.dll");
+
+        Assert.Matches("^[0-9a-f]{64}$", RelayKey);
+        Assert.Equal(1, _direct.Served);
+        Assert.Equal(0, _direct.Refused);
+    }
+
+    [Fact]
+    public async Task A_grant_for_another_key_is_refused_and_goes_through_the_server()
+    {
+        PinOverride = new string('a', 64);
+        await using var client = await ConnectAsync();
+
+        var (data, control) = await client.DownloadAsync("RETR /site/bin/app.dll");
+
+        Assert.Equal("0123456789", Encoding.ASCII.GetString(data));
+        Assert.Contains("226", control);
+        Assert.Equal(1, _direct.Refused);
+    }
+
+    [Fact]
+    public async Task A_server_that_does_not_take_the_key_gets_no_direct_requests()
+    {
+        RefuseKey = true;
+        await using var client = await ConnectAsync();
+
+        var (data, _) = await client.DownloadAsync("RETR /site/bin/app.dll");
+
+        Assert.Equal("0123456789", Encoding.ASCII.GetString(data));
+        Assert.Equal(0, _direct.Served);
+        Assert.Equal(0, _direct.Refused);
+    }
+
+    [Fact]
+    public async Task A_machine_out_of_reach_over_tcp_is_reached_over_udp()
+    {
+        // TEST-NET-1 never answers over TCP; the UDP candidates are the machine's own.
+        DirectAddress = "192.0.2.1";
+        OfferUdp = true;
+        await using var client = await ConnectAsync();
+
+        var (data, control) = await client.DownloadAsync("RETR /site/bin/app.dll");
+        var upload = await client.UploadAsync("STOR /site/udp.txt", "over udp"u8.ToArray());
+
+        Assert.Equal("0123456789", Encoding.ASCII.GetString(data));
+        Assert.Contains("226", control);
+        Assert.Contains("226", upload);
+        Assert.Equal("over udp", File.ReadAllText(Upstream("site/udp.txt")));
+        Assert.Equal(2, _direct.OverUdp);
+    }
+
+    [Fact]
     public async Task The_client_does_not_see_direct_among_the_features()
     {
         await using var client = await ConnectAsync();
@@ -231,6 +300,22 @@ public sealed class RelayDirectTests : IAsyncLifetime
                 return session.WriteAsync($"{test.DoneReply}\r\n", token);
             }
 
+            if (argument.StartsWith("KEY ", StringComparison.OrdinalIgnoreCase))
+            {
+                if (test.RefuseKey)
+                {
+                    return session.WriteAsync("501 Use SITE DIRECT RETR or STOR with a path.\r\n", token);
+                }
+
+                test.RelayKey = argument[4..].Trim();
+                return session.WriteAsync("200 Key taken.\r\n", token);
+            }
+
+            if (argument.StartsWith("UDP ", StringComparison.OrdinalIgnoreCase))
+            {
+                return UdpAsync(session, argument[4..].Split(' ', 2), token);
+            }
+
             if (test.RefuseDirect || space < 0 ||
                 !SequenceExtensions.TryResolvePath(argument[(space + 1)..], session.CurrentDirectory, out var path))
             {
@@ -242,8 +327,20 @@ public sealed class RelayDirectTests : IAsyncLifetime
             var offset = session.RestartOffset;
             session.RestartOffset = 0;
 
-            var tokenText = test._direct.Grant(physical, upload, offset);
+            var tokenText = test._direct.Grant(physical, upload, offset, test.PinOverride ?? test.RelayKey!);
             return session.WriteAsync($"200 direct://{test.DirectAddress}:{test._direct.Port}/{tokenText}?sha256={test._direct.Fingerprint}\r\n", token);
+        }
+
+        private async ValueTask UdpAsync(FtpSession session, string[] parts, CancellationToken token)
+        {
+            if (!test.OfferUdp || parts is not [var grant, var candidates])
+            {
+                await session.WriteAsync("504 Not over UDP.\r\n", token);
+                return;
+            }
+
+            var (key, own) = await test._direct.AcceptUdpAsync(Candidates.Parse(candidates));
+            await session.WriteAsync($"200 {key} {Candidates.Format(own)}\r\n", token);
         }
     }
 
@@ -252,9 +349,11 @@ public sealed class RelayDirectTests : IAsyncLifetime
     {
         private readonly TcpListener _listener = new(IPAddress.Loopback, 0);
         private readonly X509Certificate2 _certificate;
-        private readonly ConcurrentDictionary<string, (string Path, bool Upload, long Offset)> _grants = new();
+        private readonly ConcurrentDictionary<string, (string Path, bool Upload, long Offset, string Peer)> _grants = new();
         private readonly CancellationTokenSource _stop = new();
         private int _served;
+        private int _refused;
+        private int _overUdp;
 
         public FakeDirectServer()
         {
@@ -271,11 +370,38 @@ public sealed class RelayDirectTests : IAsyncLifetime
 
         public int Served => Volatile.Read(ref _served);
 
-        public string Grant(string path, bool upload, long offset)
+        /// <summary>Connections that brought a token with another key than the grant names.</summary>
+        public int Refused => Volatile.Read(ref _refused);
+
+        public int OverUdp => Volatile.Read(ref _overUdp);
+
+        public string Grant(string path, bool upload, long offset, string peer)
         {
             var token = Convert.ToHexStringLower(RandomNumberGenerator.GetBytes(24));
-            _grants[token] = (path, upload, offset);
+            _grants[token] = (path, upload, offset, peer);
             return token;
+        }
+
+        /// <summary>Waits for one connection over UDP from <paramref name="peer"/>, and serves it as one over TCP.</summary>
+        public async Task<(string Key, IReadOnlyList<IPEndPoint> Candidates)> AcceptUdpAsync(IReadOnlyList<IPEndPoint> peer)
+        {
+            var tunnel = await UdpTunnel.OpenAsync(new UdpTunnelOptions { UseStun = false, IncludeLoopback = true }, _stop.Token);
+            var key = Convert.ToHexStringLower(RandomNumberGenerator.GetBytes(16));
+
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    var stream = await tunnel.AcceptAsync(peer, key, TimeSpan.FromSeconds(10), _stop.Token);
+                    Interlocked.Increment(ref _overUdp);
+                    await ServeAsync(stream);
+                }
+                catch (Exception ex) when (ex is IOException or OperationCanceledException)
+                {
+                }
+            });
+
+            return (key, tunnel.Candidates);
         }
 
         public void Start()
@@ -299,22 +425,39 @@ public sealed class RelayDirectTests : IAsyncLifetime
                     return;
                 }
 
-                _ = ServeAsync(client);
+                _ = ServeAsync(client.GetStream());
             }
         }
 
-        private async Task ServeAsync(TcpClient client)
+        private async Task ServeAsync(Stream connection)
         {
-            using (client)
-            await using (var tls = new SslStream(client.GetStream()))
+            byte[]? shown = null;
+
+            await using (var tls = new SslStream(connection))
             {
-                await tls.AuthenticateAsServerAsync(_certificate);
+                await tls.AuthenticateAsServerAsync(new SslServerAuthenticationOptions
+                {
+                    ServerCertificate = _certificate,
+                    ClientCertificateRequired = true,
+                    RemoteCertificateValidationCallback = (_, certificate, _, _) =>
+                    {
+                        shown = certificate?.GetCertHash(HashAlgorithmName.SHA256);
+                        return shown is not null;
+                    }
+                });
 
                 var token = await ReadLineAsync(tls);
 
                 if (!_grants.TryRemove(token, out var grant))
                 {
                     await WriteAsync(tls, "ERR Unknown token\n");
+                    return;
+                }
+
+                if (!CryptographicOperations.FixedTimeEquals(shown, Convert.FromHexString(grant.Peer)))
+                {
+                    Interlocked.Increment(ref _refused);
+                    await WriteAsync(tls, "ERR Not for this key\n");
                     return;
                 }
 
