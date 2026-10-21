@@ -72,6 +72,26 @@ public class UdpTunnelTests
     }
 
     [Fact]
+    public async Task A_connection_that_comes_in_before_the_accept_is_taken()
+    {
+        var listening = await UdpTunnel.OpenAsync(Local, TestContext.Current.CancellationToken);
+        var dialing = await UdpTunnel.OpenAsync(Local, TestContext.Current.CancellationToken);
+
+        var connect = dialing.ConnectAsync(listening.Candidates, "0123456789abcdef", Timeout, TestContext.Current.CancellationToken);
+
+        // Several attempts reach the listening side before it accepts; LiteNetLib raises only the first.
+        await Task.Delay(TimeSpan.FromMilliseconds(500), TestContext.Current.CancellationToken);
+        var accept = listening.AcceptAsync(dialing.Candidates, "0123456789abcdef", Timeout, TestContext.Current.CancellationToken);
+
+        var connected = await connect;
+        await connected.WriteAsync("x"u8.ToArray(), TestContext.Current.CancellationToken);
+        var accepted = await accept;
+
+        var one = new byte[1];
+        Assert.Equal(1, await accepted.ReadAsync(one, TestContext.Current.CancellationToken));
+    }
+
+    [Fact]
     public async Task Another_key_is_not_accepted()
     {
         var listening = await UdpTunnel.OpenAsync(Local, TestContext.Current.CancellationToken);

@@ -52,6 +52,10 @@ public sealed class UdpTunnel : IDisposable
     private readonly NetManager _manager;
     private readonly EventBasedNetListener _events;
     private readonly UdpStream _stream;
+    private readonly Lock _gate = new();
+    private readonly List<ConnectionRequest> _early = [];
+    private string? _key;
+    private bool _connecting;
     private int _used;
 
     private UdpTunnel(NetManager manager, EventBasedNetListener events, UdpStream stream, List<IPEndPoint> candidates, IReadOnlyList<IPEndPoint> mapped, NatMapping nat)
@@ -62,6 +66,10 @@ public sealed class UdpTunnel : IDisposable
         Candidates = candidates;
         Mapped = mapped;
         Nat = nat;
+
+        // Requests are taken from the moment the port is open: LiteNetLib raises a request once and only updates
+        // it on later attempts, so one that came in before AcceptAsync would otherwise never be answered.
+        _events.ConnectionRequestEvent += OnConnectionRequest;
     }
 
     public int Port => _manager.LocalPort;
@@ -149,17 +157,10 @@ public sealed class UdpTunnel : IDisposable
     {
         Use();
 
-        _events.ConnectionRequestEvent += request =>
+        foreach (var request in TakeEarly(key, connecting: false))
         {
-            if (_stream.IsBound)
-            {
-                request.Reject();
-            }
-            else
-            {
-                request.AcceptIfKey(key);
-            }
-        };
+            Answer(request);
+        }
 
         // The first connection that says hello is the one; the other side drops any other that got through.
         await PunchUntilAsync(peer, _stream.Bound, timeout, token);
@@ -172,7 +173,11 @@ public sealed class UdpTunnel : IDisposable
         Use();
 
         _manager.MaxConnectAttempts = Math.Max(1, (int)(timeout.TotalMilliseconds / _manager.ReconnectDelay));
-        _events.ConnectionRequestEvent += request => request.Reject();
+
+        foreach (var request in TakeEarly(null, connecting: true))
+        {
+            request.Reject();
+        }
 
         var first = new TaskCompletionSource<NetPeer>(TaskCreationOptions.RunContinuationsAsynchronously);
 
@@ -201,6 +206,53 @@ public sealed class UdpTunnel : IDisposable
 
         await PunchUntilAsync(peer, first.Task, timeout, token);
         return _stream;
+    }
+
+    private void OnConnectionRequest(ConnectionRequest request)
+    {
+        lock (_gate)
+        {
+            if (_key is null && !_connecting)
+            {
+                if (_early.Count < Direct.Candidates.Max)
+                {
+                    _early.Add(request);
+                }
+                else
+                {
+                    request.Reject();
+                }
+
+                return;
+            }
+        }
+
+        Answer(request);
+    }
+
+    private void Answer(ConnectionRequest request)
+    {
+        if (_key is null || _stream.IsBound)
+        {
+            request.Reject();
+        }
+        else
+        {
+            request.AcceptIfKey(_key);
+        }
+    }
+
+    private List<ConnectionRequest> TakeEarly(string? key, bool connecting)
+    {
+        lock (_gate)
+        {
+            _key = key;
+            _connecting = connecting;
+
+            var early = _early.ToList();
+            _early.Clear();
+            return early;
+        }
     }
 
     private void Use()
