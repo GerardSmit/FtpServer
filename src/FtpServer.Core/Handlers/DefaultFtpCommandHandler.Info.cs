@@ -573,7 +573,7 @@ public partial class DefaultFtpCommandHandler
     }
 
     private static IEnumerable<IFtpSiteCommand> HostSiteCommands(FtpSession session) =>
-        session.RootServiceProvider.GetServices<IFtpSiteCommand>();
+        session.RootServiceProvider.GetServices<IFtpSiteCommand>().Where(x => x.IsAvailable(session));
 
     /// <summary>The SITE sub-commands on offer, as FEAT and SITE HELP list them.</summary>
     private IEnumerable<string> SiteCommands(FtpSession session)

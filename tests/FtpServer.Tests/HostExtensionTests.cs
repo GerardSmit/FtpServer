@@ -14,6 +14,18 @@ public class HostExtensionTests
             session.WriteAsync($"200 {argument}\r\n", token);
     }
 
+    private sealed class SwitchedCommand : IFtpSiteCommand
+    {
+        public static bool On { get; set; }
+
+        public string Name => "SWITCHED";
+
+        public bool IsAvailable(FtpSession session) => On;
+
+        public ValueTask ExecuteAsync(FtpSession session, string argument, CancellationToken token) =>
+            session.WriteAsync("200 on\r\n", token);
+    }
+
     private sealed class LoggedInFeature : IFtpFeatureProvider
     {
         public IEnumerable<string> GetFeatures(FtpSession session) =>
@@ -23,6 +35,7 @@ public class HostExtensionTests
     private static Task<FtpServerFixture> StartAsync() => FtpServerFixture.StartAsync(configureServices: services =>
     {
         services.AddSingleton<IFtpSiteCommand, EchoCommand>();
+        services.AddSingleton<IFtpSiteCommand, SwitchedCommand>();
         services.AddSingleton<IFtpFeatureProvider, LoggedInFeature>();
     });
 
@@ -35,6 +48,24 @@ public class HostExtensionTests
         Assert.StartsWith("200 hello there", await client.SendAsync("SITE echo hello there"));
         Assert.Contains("ECHO", await client.SendAsync("SITE HELP"), StringComparison.Ordinal);
         Assert.Contains(" SITE CHMOD;HELP;UTIME;ECHO", await client.SendAsync("FEAT"), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task A_site_command_that_is_switched_off_is_not_listed_nor_run()
+    {
+        await using var server = await StartAsync();
+        await using var client = await server.LoginAsync();
+
+        SwitchedCommand.On = false;
+
+        Assert.Contains(" SITE CHMOD;HELP;UTIME;ECHO\r\n", await client.SendAsync("FEAT"), StringComparison.Ordinal);
+        Assert.DoesNotContain("SWITCHED", await client.SendAsync("SITE HELP"), StringComparison.Ordinal);
+        Assert.StartsWith("504", await client.SendAsync("SITE SWITCHED"));
+
+        SwitchedCommand.On = true;
+
+        Assert.Contains(" SITE CHMOD;HELP;UTIME;ECHO;SWITCHED\r\n", await client.SendAsync("FEAT"), StringComparison.Ordinal);
+        Assert.StartsWith("200 on", await client.SendAsync("SITE SWITCHED"));
     }
 
     [Fact]
